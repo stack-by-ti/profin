@@ -1,0 +1,2001 @@
+{
+  "name": "Логирование Вход/Выход paginated",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "logs",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -2272,
+        4032
+      ],
+      "id": "c37e1145-1b33-4ce6-aa46-16e0d427da38",
+      "name": "Webhook",
+      "webhookId": "1ef4cff1-1e4a-4a1f-8522-7fdd1425b560"
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json;\nconst query = src.query ?? {};\nconst body  = src.body ?? src;   // иногда body может быть сразу в корне\n\nconst tz = \"+05:00\";\n\nconst getQueryValue = (obj, wantedKey) => {\n  const keys = Reflect.ownKeys(obj).map(k => String(k));\n  const norm = (s) => s.toLowerCase().replace(/\\s+/g, '').replace(/-/g, '_');\n  const target = norm(wantedKey);\n  const realKey = keys.find(k => norm(k) === target);\n  return realKey ? obj[realKey] : null;\n};\n\n// ✅ user_id: BODY first, then QUERY\nconst userIdRaw =\n  body.user_id ?? body.userId ??\n  getQueryValue(query, \"user_id\") ??\n  getQueryValue(query, \"userId\") ??\n  null;\n\n// ✅ dates: BODY first, then QUERY\nconst startD = body.startTime ?? getQueryValue(query, \"startTime\") ?? null;\nconst endD   = body.endTime   ?? getQueryValue(query, \"endTime\")   ?? null;\n\nconst startTime = startD ? `${startD}T00:00:00${tz}` : null;\nconst endTime   = endD   ? `${endD}T23:59:59${tz}` : null;\n\nif (userIdRaw === null || userIdRaw === undefined || String(userIdRaw).trim() === \"\") {\n  return [{\n    json: {\n      error: \"user_id not found\",\n      debug: {\n        queryKeys: Reflect.ownKeys(query).map(k => String(k)),\n        bodyKeys: Reflect.ownKeys(body).map(k => String(k)),\n        query,\n        body\n      }\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    user_id: String(userIdRaw),\n    startTime,\n    endTime\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -896,
+        1248
+      ],
+      "id": "7d825a6f-b619-466d-8ea8-3ee00bab1681",
+      "name": "Code in JavaScript4"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        3056,
+        736
+      ],
+      "id": "8954736b-d5f3-4692-83b4-3bd9f0addc65",
+      "name": "Respond to Webhook1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// === ИМЕНА НОД ===\nconst minNode = 'Code in JavaScript3'; // IN: { rows: [{date, first_in, inIp, employee_id, name, ...}] }\nconst maxNode = 'Code in JavaScript8'; // OUT: { rows: [{date, last_out, outIp, employee_id, name, ...}] }\n\n// === helpers ===\nconst cleanIp = (v) =>\n  (v == null) ? null : String(v)\n    .replace(/[\\u200B-\\u200D\\u2060\\uFEFF]/g, '') // zero-width chars\n    .replace(/\\s+/g, '')                        // пробелы/переводы строк\n    .trim();\n\nconst cleanDate = (v) =>\n  (v == null) ? null : String(v).trim().slice(0, 10);\n\n// === ЗАБИРАЕМ ДАННЫЕ (по 1 item) ===\nconst minWrap = $items(minNode)[0]?.json ?? {};\nconst maxWrap = $items(maxNode)[0]?.json ?? {};\n\nconst minRows = Array.isArray(minWrap.rows) ? minWrap.rows : [];\nconst maxRows = Array.isArray(maxWrap.rows) ? maxWrap.rows : [];\n\n// === СКЛЕИВАЕМ ПО ДАТЕ ===\nconst byDate = {};\n\n// входы (MIN)\nfor (const r of minRows) {\n  const date = cleanDate(r.date);\n  if (!date) continue;\n\n  if (!byDate[date]) byDate[date] = {};\n\n  // first_in: берём минимальный\n  if (r.first_in) {\n    if (!byDate[date].first_in || r.first_in < byDate[date].first_in) {\n      byDate[date].first_in = r.first_in;\n      byDate[date].inIp = cleanIp(r.inIp ?? r.device_ip ?? r.device_ip ?? null);\n    }\n  }\n\n  if (r.employee_id != null) byDate[date].employee_id = r.employee_id;\n  if (r.name != null) byDate[date].name = r.name;\n}\n\n// выходы (MAX)\nfor (const r of maxRows) {\n  const date = cleanDate(r.date);\n  if (!date) continue;\n\n  if (!byDate[date]) byDate[date] = {};\n\n  // last_out: берём максимальный\n  if (r.last_out) {\n    if (!byDate[date].last_out || r.last_out > byDate[date].last_out) {\n      byDate[date].last_out = r.last_out;\n      byDate[date].outIp = cleanIp(r.outIp ?? r.device_ip ?? null);\n    }\n  }\n\n  // если IN не дал — возьмём из OUT\n  if (byDate[date].employee_id == null && r.employee_id != null) byDate[date].employee_id = r.employee_id;\n  if (byDate[date].name == null && r.name != null) byDate[date].name = r.name;\n}\n\n// === ФОРМИРУЕМ РЕЗУЛЬТАТ ПО ДНЯМ ===\nconst days = Object.entries(byDate)\n  .map(([date, v]) => {\n    const first_in = v.first_in ?? null;\n    const last_out = v.last_out ?? null;\n\n    let status = \"ok\";\n    let message = \"OK\";\n\n    if (!first_in && !last_out) {\n      status = \"no_data\";\n      message = \"За день событий нет.\";\n    } else if (!first_in || !last_out) {\n      status = \"partial\";\n      message = \"Найден только вход или только выход.\";\n    }\n\n    return {\n      date,\n      employee_id: v.employee_id ?? null,\n      name: v.name ?? null,\n      first_in,\n      last_out,\n      inIp: cleanIp(v.inIp ?? null),\n      outIp: cleanIp(v.outIp ?? null),\n      status,\n      message\n    };\n  })\n  .sort((a, b) => (a.date < b.date ? -1 : 1));\n\n// === ОБЩИЙ СТАТУС ===\nlet overall_status = \"ok\";\nlet overall_message = \"OK\";\n\nif (!days.length) {\n  overall_status = \"no_data\";\n  overall_message = \"За период событий нет.\";\n} else if (days.some(d => d.status === \"partial\")) {\n  overall_status = \"partial\";\n  overall_message = \"Данные за период получены частично.\";\n}\n\nreturn [{\n  json: {\n    status: overall_status,\n    message: overall_message,\n    days,\n    debug: {\n      in_rows: minRows.length,\n      out_rows: maxRows.length,\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2832,
+        736
+      ],
+      "id": "138d5d17-9d26-47a7-b7b6-a26d2bfb9995",
+      "name": "Code in JavaScript7"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -448,
+        1248
+      ],
+      "id": "17742c56-7a39-4779-a14c-dc7c675170dd",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "name": "Replace Me",
+      "typeVersion": 1,
+      "position": [
+        976,
+        1680
+      ],
+      "id": "9bc20014-8c66-4bf8-8e9e-679fffdb844e"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "Co5ibzdT1dOVYTxL",
+          "mode": "list",
+          "cachedResultName": "int",
+          "cachedResultUrl": "/projects/TmNIdtTy7ks3j2lE/datatables/Co5ibzdT1dOVYTxL"
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        -672,
+        1248
+      ],
+      "id": "f9235393-8759-4483-a232-5bb4abe74a46",
+      "name": "Get row(s)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.all().map(i => i.json);\n\n// разворачиваем: device -> days[]\nconst rows = [];\n\nfor (const r of raw) {\n  const deviceIp = r.device_ip ?? r.deviceIp ?? r.ip ?? null;\n\n  const days = Array.isArray(r.days) ? r.days : [];\n  if (!days.length) {\n    // если хочешь видеть строки даже когда данных нет — раскомментируй:\n    // rows.push({\n    //   device_ip: deviceIp,\n    //   status: r.status ?? null,\n    //   message: r.message ?? null,\n    //   date: null,\n    //   first_in: null,\n    //   employee_id: null,\n    //   name: null,\n    // });\n    continue;\n  }\n\n  for (const d of days) {\n    rows.push({\n      device_ip: deviceIp,\n      status: r.status ?? null,\n      message: r.message ?? null,\n\n      date: d.date ?? null,\n      first_in: d.first_in ?? null,\n      employee_id: d.employee_id ?? null,\n      name: d.name ?? null,\n\n      inIp: d.inIp ?? deviceIp, // на всякий\n    });\n  }\n}\n\nreturn [{\n  json: {\n    rows,\n    count: rows.length,\n    devices_count: raw.length,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        848
+      ],
+      "id": "07dca25b-01b3-486f-ab11-6e737567826a",
+      "name": "Code in JavaScript3"
+    },
+    {
+      "parameters": {
+        "url": "=http://{{ $('Loop Over Items').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Connection",
+              "value": "keep-alive"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -160,
+        1328
+      ],
+      "id": "bedb4533-c4ca-48a4-befc-a59cf16a3527",
+      "name": "Запрос токена2",
+      "alwaysOutputData": false,
+      "executeOnce": false,
+      "notesInFlow": false,
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ======= Чистая реализация MD5 (без внешних библиотек) =======\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n\n  /* -- подготовка строки -- */\n  const u8 = unescape(encodeURIComponent(str));           // UTF-8\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;             // кратно 16\n  const X = new Array(nWords).fill(0);\n\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n\n  /* -- начальные константы -- */\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n\n  /* -- основной цикл -- */\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478);   d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB);  b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF);   d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613);  b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8);   d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i +10], 17, 0xFFFF5BB1);  b = FF(b, c, d, a, X[i +11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i +12], 7, 0x6B901122);   d = FF(d, a, b, c, X[i +13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i +14], 17, 0xA679438E);  b = FF(b, c, d, a, X[i +15], 22, 0x49B40821);\n\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562);   d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i +11],14, 0x265E5A51);   b = GG(b, c, d, a, X[i + 0],20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D);   d = GG(d, a, b, c, X[i +10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i +15],14, 0xD8A1E681);   b = GG(b, c, d, a, X[i + 4],20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6);   d = GG(d, a, b, c, X[i +14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3],14, 0xF4D50D87);   b = GG(b, c, d, a, X[i + 8],20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i +13], 5, 0xA9E3E905);   d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7],14, 0x676F02D9);   b = GG(b, c, d, a, X[i +12],20, 0x8D2A4C8A);\n\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942);   d = HH(d, a, b, c, X[i + 8],11, 0x8771F681);\n    c = HH(c, d, a, b, X[i +11],16, 0x6D9D6122);   b = HH(b, c, d, a, X[i +14],23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44);   d = HH(d, a, b, c, X[i + 4],11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7],16, 0xF6BB4B60);   b = HH(b, c, d, a, X[i +10],23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i +13], 4, 0x289B7EC6);   d = HH(d, a, b, c, X[i + 0],11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3],16, 0xD4EF3085);   b = HH(b, c, d, a, X[i + 6],23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039);   d = HH(d, a, b, c, X[i +12],11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i +15],16, 0x1FA27CF8);   b = HH(b, c, d, a, X[i + 2],23, 0xC4AC5665);\n\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244);   d = II(d, a, b, c, X[i + 7],10, 0x432AFF97);\n    c = II(c, d, a, b, X[i +14],15, 0xAB9423A7);   b = II(b, c, d, a, X[i + 5],21, 0xFC93A039);\n    a = II(a, b, c, d, X[i +12], 6, 0x655B59C3);   d = II(d, a, b, c, X[i + 3],10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i +10],15, 0xFFEFF47D);   b = II(b, c, d, a, X[i + 1],21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F);   d = II(d, a, b, c, X[i +15],10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6],15, 0xA3014314);   b = II(b, c, d, a, X[i +13],21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82);   d = II(d, a, b, c, X[i +11],10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2],15, 0x2AD7D2BB);   b = II(b, c, d, a, X[i + 9],21, 0xEB86D391);\n\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n\n  const hexLE = (w) =>\n    ('0' + ( w        & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >>  8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\n// ======= Digest Auth генерируется ниже =======\nconst username = 'admin';\nconst password = 'WPvH93sqmY';\nconst method = 'POST';\nconst uri = '/ISAPI/AccessControl/AcsEvent?format=json';\nconst body = '<RemoteControlDoor><cmd>open</cmd></RemoteControlDoor>';\n\n\nconst wwwAuth = $input.first().json.headers['www-authenticate'];\nconst realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)[1];\n\nconst nc     = '00000001';\nconst cnonce = '8vNMwecd'; \n\nconst ha1 = md5(`${username}:${realm}:${password}`);\nconst ha2 = md5(`${method}:${uri}`);\nconst response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);\n\nconst authHeader =\n  `Digest username=\"${username}\",realm=\"${realm}\",nonce=\"${nonce}\",` +\n  `uri=\"${uri}\",algorithm=\"MD5\",qop=${qop},nc=${nc},` +\n  `cnonce=\"${cnonce}\",response=\"${response}\"`;\n\nreturn { authHeader };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        64,
+        1328
+      ],
+      "id": "13c96b98-0af3-4612-9eb6-6fc17e37cec0",
+      "name": "Шифрование1",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $('Loop Over Items').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $json.authHeader }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"AcsEventCond\": {\n    \"searchID\": \"in_{{$execution.id}}\",\n    \"searchResultPosition\": 0,\n    \"maxResults\": 200,\n    \"major\": 5,\n    \"minor\": 75,\n    \"startTime\": \"{{ $('Code in JavaScript4').item.json.startTime }}\",\n    \"endTime\": \"{{ $('Code in JavaScript4').item.json.endTime }}\",\n    \"employeeNoString\": \"{{ $('Code in JavaScript4').item.json.user_id }}\"\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        272,
+        1328
+      ],
+      "id": "6da958a2-65e3-488b-8d83-e89183a1b2bb",
+      "name": "Регистрация пользователя1",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n  const u8 = unescape(encodeURIComponent(str));\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;\n  const X = new Array(nWords).fill(0);\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478); d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB); b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF); d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613); b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8); d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i + 10], 17, 0xFFFF5BB1); b = FF(b, c, d, a, X[i + 11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i + 12], 7, 0x6B901122); d = FF(d, a, b, c, X[i + 13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i + 14], 17, 0xA679438E); b = FF(b, c, d, a, X[i + 15], 22, 0x49B40821);\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562); d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i + 11], 14, 0x265E5A51); b = GG(b, c, d, a, X[i + 0], 20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D); d = GG(d, a, b, c, X[i + 10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i + 15], 14, 0xD8A1E681); b = GG(b, c, d, a, X[i + 4], 20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6); d = GG(d, a, b, c, X[i + 14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3], 14, 0xF4D50D87); b = GG(b, c, d, a, X[i + 8], 20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i + 13], 5, 0xA9E3E905); d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7], 14, 0x676F02D9); b = GG(b, c, d, a, X[i + 12], 20, 0x8D2A4C8A);\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942); d = HH(d, a, b, c, X[i + 8], 11, 0x8771F681);\n    c = HH(c, d, a, b, X[i + 11], 16, 0x6D9D6122); b = HH(b, c, d, a, X[i + 14], 23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44); d = HH(d, a, b, c, X[i + 4], 11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7], 16, 0xF6BB4B60); b = HH(b, c, d, a, X[i + 10], 23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i + 13], 4, 0x289B7EC6); d = HH(d, a, b, c, X[i + 0], 11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3], 16, 0xD4EF3085); b = HH(b, c, d, a, X[i + 6], 23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039); d = HH(d, a, b, c, X[i + 12], 11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i + 15], 16, 0x1FA27CF8); b = HH(b, c, d, a, X[i + 2], 23, 0xC4AC5665);\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244); d = II(d, a, b, c, X[i + 7], 10, 0x432AFF97);\n    c = II(c, d, a, b, X[i + 14], 15, 0xAB9423A7); b = II(b, c, d, a, X[i + 5], 21, 0xFC93A039);\n    a = II(a, b, c, d, X[i + 12], 6, 0x655B59C3); d = II(d, a, b, c, X[i + 3], 10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i + 10], 15, 0xFFEFF47D); b = II(b, c, d, a, X[i + 1], 21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F); d = II(d, a, b, c, X[i + 15], 10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6], 15, 0xA3014314); b = II(b, c, d, a, X[i + 13], 21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82); d = II(d, a, b, c, X[i + 11], 10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2], 15, 0x2AD7D2BB); b = II(b, c, d, a, X[i + 9], 21, 0xEB86D391);\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n  const hexLE = (w) =>\n    ('0' + (w & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\nfunction digestHeader(wwwAuth, username, password, method, uri) {\n  const realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)?.[1] ?? 'auth';\n  if (!realm || !nonce) throw new Error('Digest challenge is missing realm or nonce');\n  const nc = '00000001';\n  const cnonce = Math.random().toString(36).slice(2, 10);\n  const ha1 = md5(username + ':' + realm + ':' + password);\n  const ha2 = md5(method + ':' + uri);\n  const response = md5(ha1 + ':' + nonce + ':' + nc + ':' + cnonce + ':' + qop + ':' + ha2);\n  return 'Digest username=\"' + username + '\",realm=\"' + realm + '\",nonce=\"' + nonce + '\",uri=\"' + uri + '\",algorithm=\"MD5\",qop=' + qop + ',nc=' + nc + ',cnonce=\"' + cnonce + '\",response=\"' + response + '\"';\n}\n\nasync function httpJson(options) {\n  const response = await this.helpers.httpRequest({\n    ...options,\n    json: true,\n    simple: false,\n    resolveWithFullResponse: true,\n    returnFullResponse: true,\n    ignoreHttpStatusErrors: true,\n  });\n\n  let body = response.body ?? null;\n  if (typeof body === 'string') {\n    try { body = JSON.parse(body); } catch (e) {}\n  }\n\n  return {\n    statusCode: response.statusCode ?? response.status ?? 0,\n    headers: response.headers ?? {},\n    body,\n  };\n}\n\nfunction getHeader(headers, name) {\n  const target = name.toLowerCase();\n  const key = Object.keys(headers ?? {}).find((k) => k.toLowerCase() === target);\n  return key ? headers[key] : null;\n}\n\nasync function fetchAcsEventsPaged(deviceIp, { startTime, endTime, userId, searchPrefix }) {\n  const username = 'admin';\n  const password = 'WPvH93sqmY';\n  const uri = '/ISAPI/AccessControl/AcsEvent?format=json';\n  const url = 'http://' + deviceIp + uri;\n  const pageSize = 200;\n  const maxPages = 50;\n\n  const challenge = await httpJson.call(this, { method: 'GET', url, headers: { Connection: 'keep-alive' } });\n  const wwwAuth = getHeader(challenge.headers, 'www-authenticate');\n  if (!wwwAuth) {\n    throw new Error('Device ' + deviceIp + ' did not return digest challenge, status ' + challenge.statusCode);\n  }\n\n  const all = [];\n  for (let page = 0; page < maxPages; page++) {\n    const position = page * pageSize;\n    const body = {\n      AcsEventCond: {\n        searchID: searchPrefix + '_' + $execution.id + '_' + deviceIp + '_' + page,\n        searchResultPosition: position,\n        maxResults: pageSize,\n        major: 5,\n        minor: 75,\n        startTime,\n        endTime,\n        employeeNoString: String(userId),\n      },\n    };\n\n    const authHeader = digestHeader(wwwAuth, username, password, 'POST', uri);\n    const resp = await httpJson.call(this, {\n      method: 'POST',\n      url,\n      headers: {\n        Authorization: authHeader,\n        'Content-Type': 'application/json',\n      },\n      body,\n    });\n\n    if (resp.statusCode >= 400) {\n      throw new Error('Device ' + deviceIp + ' returned HTTP ' + resp.statusCode + ' at position ' + position);\n    }\n\n    const list = resp.body?.AcsEvent?.InfoList ?? [];\n    all.push(...list);\n\n    const total = Number(resp.body?.AcsEvent?.totalMatches ?? resp.body?.AcsEvent?.numOfMatches ?? NaN);\n    if (list.length < pageSize) break;\n    if (Number.isFinite(total) && position + list.length >= total) break;\n  }\n\n  return all;\n}\n\nfunction dayRanges(startTime, endTime) {\n  const startDate = startTime.slice(0, 10);\n  const endDate = endTime.slice(0, 10);\n  const tz = startTime.slice(19) || '+05:00';\n\n  const result = [];\n  let d = new Date(startDate + 'T00:00:00Z');\n  const end = new Date(endDate + 'T00:00:00Z');\n\n  while (d <= end) {\n    const yyyy = d.getUTCFullYear();\n    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');\n    const dd = String(d.getUTCDate()).padStart(2, '0');\n    const date = yyyy + '-' + mm + '-' + dd;\n\n    result.push({\n      date,\n      startTime: date + 'T00:00:00' + tz,\n      endTime: date + 'T23:59:59' + tz,\n    });\n\n    d.setUTCDate(d.getUTCDate() + 1);\n  }\n\n  return result;\n}\n\nconst meta = $('Loop Over Items').item.json ?? $json ?? {};\nconst deviceIp = meta.ip ?? meta.device_ip ?? null;\nconst params = $items('Code in JavaScript4')[0].json;\n\ntry {\n  const allEvents = [];\n\n  for (const range of dayRanges(params.startTime, params.endTime)) {\n    const list = await fetchAcsEventsPaged.call(this, deviceIp, {\n      startTime: range.startTime,\n      endTime: range.endTime,\n      userId: params.user_id,\n      searchPrefix: 'in_' + range.date,\n    });\n\n    allEvents.push(...list);\n  }\n\n  const events = allEvents.filter((e) =>\n    e.major === 5 &&\n    e.minor === 75 &&\n    e.time &&\n    String(e.employeeNoString) === String(params.user_id)\n  );\n\n  const byDay = {};\n  for (const e of events) {\n    const date = e.time.slice(0, 10);\n    if (!byDay[date]) byDay[date] = [];\n    byDay[date].push(e);\n  }\n\n  const days = Object.entries(byDay).map(([date, arr]) => {\n    let first = arr[0];\n    let minMs = new Date(first.time).getTime();\n\n    for (const e of arr) {\n      const ms = new Date(e.time).getTime();\n      if (ms < minMs) {\n        first = e;\n        minMs = ms;\n      }\n    }\n\n    return {\n      date,\n      first_in: first.time,\n      employee_id: first.employeeNoString ?? null,\n      name: first.name ?? null,\n      inIp: deviceIp,\n    };\n  });\n\n  return [{\n    json: {\n      status: days.length ? 'ok' : 'no_data',\n      message: days.length ? 'OK' : 'За указанный период событий нет',\n      device_ip: deviceIp,\n      days,\n      pages_mode: 'daily',\n      raw_events: events.length,\n    },\n  }];\n} catch (error) {\n  return [{\n    json: {\n      status: 'device_error',\n      message: error.message,\n      device_ip: deviceIp,\n      days: [],\n    },\n  }];\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        512,
+        1328
+      ],
+      "id": "7564d352-c58a-4bd9-a894-3fabb779ab2b",
+      "name": "Code in JavaScript5"
+    },
+    {
+      "parameters": {
+        "content": "## Минимальный вход \n",
+        "height": 256,
+        "width": 928
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -208,
+        1264
+      ],
+      "typeVersion": 1,
+      "id": "0e38d547-f492-49c3-b092-b8147bd77a3b",
+      "name": "Sticky Note2"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1808,
+        1184
+      ],
+      "id": "fe6e5279-bf47-4320-a3d7-fbc2ded07b12",
+      "name": "Loop Over Items1"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "name": "Replace Me1",
+      "typeVersion": 1,
+      "position": [
+        3232,
+        1616
+      ],
+      "id": "0c713fc0-c575-47b5-b129-52e494bbfdef"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "jYClZ3yMQFDT732S",
+          "mode": "list",
+          "cachedResultName": "outp",
+          "cachedResultUrl": "/projects/TmNIdtTy7ks3j2lE/datatables/jYClZ3yMQFDT732S"
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1584,
+        1184
+      ],
+      "id": "09bbaca9-aceb-4576-95df-e4cdf59bed86",
+      "name": "Get row(s)1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.all().map(i => i.json);\n\nconst rows = [];\n\nfor (const r of raw) {\n  const deviceIp = r.device_ip ?? r.deviceIp ?? r.ip ?? null;\n  const days = Array.isArray(r.days) ? r.days : [];\n\n  for (const d of days) {\n    rows.push({\n      device_ip: deviceIp,\n      status: r.status ?? null,\n      message: r.message ?? null,\n\n      date: d.date ?? null,\n\n      // IN\n      first_in: d.first_in ?? null,\n      inIp: d.inIp ?? null,\n\n      // OUT\n      last_out: d.last_out ?? null,\n      outIp: d.outIp ?? null,\n\n      // common\n      employee_id: d.employee_id ?? null,\n      name: d.name ?? null,\n    });\n  }\n\n  // если нужно видеть устройства без событий — добавь пустую строку\n  // if (!days.length) {\n  //   rows.push({\n  //     device_ip: deviceIp,\n  //     status: r.status ?? null,\n  //     message: r.message ?? null,\n  //     date: null,\n  //     first_in: null,\n  //     last_out: null,\n  //     employee_id: null,\n  //     name: null,\n  //     inIp: null,\n  //     outIp: null,\n  //   });\n  // }\n}\n\nreturn [{\n  json: {\n    rows,\n    count: rows.length,\n    devices_count: raw.length,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        784
+      ],
+      "id": "00799082-8dea-4c2b-90f4-c834aa09ef16",
+      "name": "Code in JavaScript8"
+    },
+    {
+      "parameters": {
+        "url": "=http://{{ $('Loop Over Items1').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Connection",
+              "value": "keep-alive"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2224,
+        1328
+      ],
+      "id": "40a5d783-5f59-415f-a7e9-2d4479d9d18d",
+      "name": "Запрос токена3",
+      "alwaysOutputData": false,
+      "executeOnce": false,
+      "notesInFlow": false,
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ======= Чистая реализация MD5 (без внешних библиотек) =======\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n\n  /* -- подготовка строки -- */\n  const u8 = unescape(encodeURIComponent(str));           // UTF-8\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;             // кратно 16\n  const X = new Array(nWords).fill(0);\n\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n\n  /* -- начальные константы -- */\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n\n  /* -- основной цикл -- */\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478);   d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB);  b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF);   d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613);  b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8);   d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i +10], 17, 0xFFFF5BB1);  b = FF(b, c, d, a, X[i +11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i +12], 7, 0x6B901122);   d = FF(d, a, b, c, X[i +13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i +14], 17, 0xA679438E);  b = FF(b, c, d, a, X[i +15], 22, 0x49B40821);\n\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562);   d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i +11],14, 0x265E5A51);   b = GG(b, c, d, a, X[i + 0],20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D);   d = GG(d, a, b, c, X[i +10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i +15],14, 0xD8A1E681);   b = GG(b, c, d, a, X[i + 4],20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6);   d = GG(d, a, b, c, X[i +14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3],14, 0xF4D50D87);   b = GG(b, c, d, a, X[i + 8],20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i +13], 5, 0xA9E3E905);   d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7],14, 0x676F02D9);   b = GG(b, c, d, a, X[i +12],20, 0x8D2A4C8A);\n\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942);   d = HH(d, a, b, c, X[i + 8],11, 0x8771F681);\n    c = HH(c, d, a, b, X[i +11],16, 0x6D9D6122);   b = HH(b, c, d, a, X[i +14],23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44);   d = HH(d, a, b, c, X[i + 4],11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7],16, 0xF6BB4B60);   b = HH(b, c, d, a, X[i +10],23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i +13], 4, 0x289B7EC6);   d = HH(d, a, b, c, X[i + 0],11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3],16, 0xD4EF3085);   b = HH(b, c, d, a, X[i + 6],23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039);   d = HH(d, a, b, c, X[i +12],11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i +15],16, 0x1FA27CF8);   b = HH(b, c, d, a, X[i + 2],23, 0xC4AC5665);\n\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244);   d = II(d, a, b, c, X[i + 7],10, 0x432AFF97);\n    c = II(c, d, a, b, X[i +14],15, 0xAB9423A7);   b = II(b, c, d, a, X[i + 5],21, 0xFC93A039);\n    a = II(a, b, c, d, X[i +12], 6, 0x655B59C3);   d = II(d, a, b, c, X[i + 3],10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i +10],15, 0xFFEFF47D);   b = II(b, c, d, a, X[i + 1],21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F);   d = II(d, a, b, c, X[i +15],10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6],15, 0xA3014314);   b = II(b, c, d, a, X[i +13],21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82);   d = II(d, a, b, c, X[i +11],10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2],15, 0x2AD7D2BB);   b = II(b, c, d, a, X[i + 9],21, 0xEB86D391);\n\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n\n  const hexLE = (w) =>\n    ('0' + ( w        & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >>  8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\n// ======= Digest Auth генерируется ниже =======\nconst username = 'admin';\nconst password = 'WPvH93sqmY';\nconst method = 'POST';\nconst uri = '/ISAPI/AccessControl/AcsEvent?format=json';\nconst body = '<RemoteControlDoor><cmd>open</cmd></RemoteControlDoor>';\n\n\nconst wwwAuth = $input.first().json.headers['www-authenticate'];\nconst realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)[1];\n\nconst nc     = '00000001';\nconst cnonce = '8vNMwecd';              // фиксированный — получим тот же response\n\nconst ha1 = md5(`${username}:${realm}:${password}`);\nconst ha2 = md5(`${method}:${uri}`);\nconst response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);\n\nconst authHeader =\n  `Digest username=\"${username}\",realm=\"${realm}\",nonce=\"${nonce}\",` +\n  `uri=\"${uri}\",algorithm=\"MD5\",qop=${qop},nc=${nc},` +\n  `cnonce=\"${cnonce}\",response=\"${response}\"`;\n\nreturn { authHeader };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2448,
+        1328
+      ],
+      "id": "2eaeeaeb-da51-4763-9fee-1ebed71f4739",
+      "name": "Шифрование3",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $('Loop Over Items1').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $json.authHeader }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"AcsEventCond\": {\n    \"searchID\": \"in_{{$execution.id}}\",\n    \"searchResultPosition\": 0,\n    \"maxResults\": 200,\n    \"major\": 5,\n    \"minor\": 75,\n\"startTime\": \"{{ $items('Code in JavaScript4')[0].json.startTime }}\",\n\"endTime\":   \"{{ $items('Code in JavaScript4')[0].json.endTime }}\",\n\"employeeNoString\": \"{{ $items('Code in JavaScript4')[0].json.user_id }}\"\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2656,
+        1328
+      ],
+      "id": "493183a4-c4f9-48c8-b713-09abc422cdac",
+      "name": "Регистрация пользователя3",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n  const u8 = unescape(encodeURIComponent(str));\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;\n  const X = new Array(nWords).fill(0);\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478); d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB); b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF); d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613); b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8); d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i + 10], 17, 0xFFFF5BB1); b = FF(b, c, d, a, X[i + 11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i + 12], 7, 0x6B901122); d = FF(d, a, b, c, X[i + 13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i + 14], 17, 0xA679438E); b = FF(b, c, d, a, X[i + 15], 22, 0x49B40821);\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562); d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i + 11], 14, 0x265E5A51); b = GG(b, c, d, a, X[i + 0], 20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D); d = GG(d, a, b, c, X[i + 10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i + 15], 14, 0xD8A1E681); b = GG(b, c, d, a, X[i + 4], 20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6); d = GG(d, a, b, c, X[i + 14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3], 14, 0xF4D50D87); b = GG(b, c, d, a, X[i + 8], 20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i + 13], 5, 0xA9E3E905); d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7], 14, 0x676F02D9); b = GG(b, c, d, a, X[i + 12], 20, 0x8D2A4C8A);\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942); d = HH(d, a, b, c, X[i + 8], 11, 0x8771F681);\n    c = HH(c, d, a, b, X[i + 11], 16, 0x6D9D6122); b = HH(b, c, d, a, X[i + 14], 23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44); d = HH(d, a, b, c, X[i + 4], 11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7], 16, 0xF6BB4B60); b = HH(b, c, d, a, X[i + 10], 23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i + 13], 4, 0x289B7EC6); d = HH(d, a, b, c, X[i + 0], 11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3], 16, 0xD4EF3085); b = HH(b, c, d, a, X[i + 6], 23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039); d = HH(d, a, b, c, X[i + 12], 11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i + 15], 16, 0x1FA27CF8); b = HH(b, c, d, a, X[i + 2], 23, 0xC4AC5665);\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244); d = II(d, a, b, c, X[i + 7], 10, 0x432AFF97);\n    c = II(c, d, a, b, X[i + 14], 15, 0xAB9423A7); b = II(b, c, d, a, X[i + 5], 21, 0xFC93A039);\n    a = II(a, b, c, d, X[i + 12], 6, 0x655B59C3); d = II(d, a, b, c, X[i + 3], 10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i + 10], 15, 0xFFEFF47D); b = II(b, c, d, a, X[i + 1], 21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F); d = II(d, a, b, c, X[i + 15], 10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6], 15, 0xA3014314); b = II(b, c, d, a, X[i + 13], 21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82); d = II(d, a, b, c, X[i + 11], 10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2], 15, 0x2AD7D2BB); b = II(b, c, d, a, X[i + 9], 21, 0xEB86D391);\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n  const hexLE = (w) =>\n    ('0' + (w & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\nfunction digestHeader(wwwAuth, username, password, method, uri) {\n  const realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)?.[1] ?? 'auth';\n  if (!realm || !nonce) throw new Error('Digest challenge is missing realm or nonce');\n  const nc = '00000001';\n  const cnonce = Math.random().toString(36).slice(2, 10);\n  const ha1 = md5(username + ':' + realm + ':' + password);\n  const ha2 = md5(method + ':' + uri);\n  const response = md5(ha1 + ':' + nonce + ':' + nc + ':' + cnonce + ':' + qop + ':' + ha2);\n  return 'Digest username=\"' + username + '\",realm=\"' + realm + '\",nonce=\"' + nonce + '\",uri=\"' + uri + '\",algorithm=\"MD5\",qop=' + qop + ',nc=' + nc + ',cnonce=\"' + cnonce + '\",response=\"' + response + '\"';\n}\n\nasync function httpJson(options) {\n  const response = await this.helpers.httpRequest({\n    ...options,\n    json: true,\n    simple: false,\n    resolveWithFullResponse: true,\n    returnFullResponse: true,\n    ignoreHttpStatusErrors: true,\n  });\n\n  let body = response.body ?? null;\n  if (typeof body === 'string') {\n    try { body = JSON.parse(body); } catch (e) {}\n  }\n\n  return {\n    statusCode: response.statusCode ?? response.status ?? 0,\n    headers: response.headers ?? {},\n    body,\n  };\n}\n\nfunction getHeader(headers, name) {\n  const target = name.toLowerCase();\n  const key = Object.keys(headers ?? {}).find((k) => k.toLowerCase() === target);\n  return key ? headers[key] : null;\n}\n\nasync function fetchAcsEventsPaged(deviceIp, { startTime, endTime, userId, searchPrefix }) {\n  const username = 'admin';\n  const password = 'WPvH93sqmY';\n  const uri = '/ISAPI/AccessControl/AcsEvent?format=json';\n  const url = 'http://' + deviceIp + uri;\n  const pageSize = 200;\n  const maxPages = 50;\n\n  const challenge = await httpJson.call(this, { method: 'GET', url, headers: { Connection: 'keep-alive' } });\n  const wwwAuth = getHeader(challenge.headers, 'www-authenticate');\n  if (!wwwAuth) {\n    throw new Error('Device ' + deviceIp + ' did not return digest challenge, status ' + challenge.statusCode);\n  }\n\n  const all = [];\n  for (let page = 0; page < maxPages; page++) {\n    const position = page * pageSize;\n    const body = {\n      AcsEventCond: {\n        searchID: searchPrefix + '_' + $execution.id + '_' + deviceIp + '_' + page,\n        searchResultPosition: position,\n        maxResults: pageSize,\n        major: 5,\n        minor: 75,\n        startTime,\n        endTime,\n        employeeNoString: String(userId),\n      },\n    };\n\n    const authHeader = digestHeader(wwwAuth, username, password, 'POST', uri);\n    const resp = await httpJson.call(this, {\n      method: 'POST',\n      url,\n      headers: {\n        Authorization: authHeader,\n        'Content-Type': 'application/json',\n      },\n      body,\n    });\n\n    if (resp.statusCode >= 400) {\n      throw new Error('Device ' + deviceIp + ' returned HTTP ' + resp.statusCode + ' at position ' + position);\n    }\n\n    const list = resp.body?.AcsEvent?.InfoList ?? [];\n    all.push(...list);\n\n    const total = Number(resp.body?.AcsEvent?.totalMatches ?? resp.body?.AcsEvent?.numOfMatches ?? NaN);\n    if (list.length < pageSize) break;\n    if (Number.isFinite(total) && position + list.length >= total) break;\n  }\n\n  return all;\n}\n\nfunction dayRanges(startTime, endTime) {\n  const startDate = startTime.slice(0, 10);\n  const endDate = endTime.slice(0, 10);\n  const tz = startTime.slice(19) || '+05:00';\n\n  const result = [];\n  let d = new Date(startDate + 'T00:00:00Z');\n  const end = new Date(endDate + 'T00:00:00Z');\n\n  while (d <= end) {\n    const yyyy = d.getUTCFullYear();\n    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');\n    const dd = String(d.getUTCDate()).padStart(2, '0');\n    const date = yyyy + '-' + mm + '-' + dd;\n\n    result.push({\n      date,\n      startTime: date + 'T00:00:00' + tz,\n      endTime: date + 'T23:59:59' + tz,\n    });\n\n    d.setUTCDate(d.getUTCDate() + 1);\n  }\n\n  return result;\n}\n\nconst meta = $('Loop Over Items1').item.json ?? $json ?? {};\nconst deviceIp = meta.ip ?? meta.device_ip ?? null;\nconst params = $items('Code in JavaScript4')[0].json;\n\ntry {\n  const allEvents = [];\n\n  for (const range of dayRanges(params.startTime, params.endTime)) {\n    const list = await fetchAcsEventsPaged.call(this, deviceIp, {\n      startTime: range.startTime,\n      endTime: range.endTime,\n      userId: params.user_id,\n      searchPrefix: 'out_' + range.date,\n    });\n\n    allEvents.push(...list);\n  }\n\n  const events = allEvents.filter((e) =>\n    e.major === 5 &&\n    e.minor === 75 &&\n    e.time &&\n    String(e.employeeNoString) === String(params.user_id)\n  );\n\n  if (!events.length) {\n    return [{\n      json: {\n        status: 'no_data',\n        message: 'На выходном домофоне нет событий за выбранный период',\n        device_ip: deviceIp,\n        days: [],\n        pages_mode: 'daily',\n        raw_events: 0,\n      },\n    }];\n  }\n\n  const byDay = {};\n  for (const e of events) {\n    const date = e.time.slice(0, 10);\n    if (!byDay[date]) byDay[date] = [];\n    byDay[date].push(e);\n  }\n\n  const days = Object.entries(byDay).map(([date, arr]) => {\n    let last = arr[0];\n    let maxMs = new Date(last.time).getTime();\n\n    for (const e of arr) {\n      const ms = new Date(e.time).getTime();\n      if (ms > maxMs) {\n        last = e;\n        maxMs = ms;\n      }\n    }\n\n    return {\n      date,\n      last_out: last.time,\n      employee_id: last.employeeNoString ?? null,\n      name: last.name ?? null,\n      outIp: deviceIp,\n    };\n  });\n\n  return [{\n    json: {\n      status: 'ok',\n      message: 'OK',\n      device_ip: deviceIp,\n      days,\n      pages_mode: 'daily',\n      raw_events: events.length,\n    },\n  }];\n} catch (error) {\n  return [{\n    json: {\n      status: 'device_error',\n      message: error.message,\n      device_ip: deviceIp,\n      days: [],\n    },\n  }];\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2896,
+        1328
+      ],
+      "id": "e9a6c479-fa25-41f1-ba31-2a28cd4a5897",
+      "name": "Code in JavaScript6"
+    },
+    {
+      "parameters": {
+        "content": "## Максимальный выход\n",
+        "height": 256,
+        "width": 832,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2208,
+        1264
+      ],
+      "typeVersion": 1,
+      "id": "d5fffe08-9fdf-4681-9d48-7071b597dac3",
+      "name": "Sticky Note3"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Webhook').item.json.body.lvl }}",
+                    "rightValue": "={{ '1'.toNumber() }}",
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    },
+                    "id": "4e83a979-f247-4277-a824-b1c20ec3f9f7"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "13f4ca33-f265-4bb2-8973-8fe7a11bc372",
+                    "leftValue": "={{ $('Webhook').item.json.body.lvl }}",
+                    "rightValue": "={{ '2'.toNumber() }}",
+                    "operator": {
+                      "type": "dateTime",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "e3828582-1ef9-4c85-b49a-3eb869707086",
+                    "leftValue": "={{ $('Webhook').item.json.body.lvl }}",
+                    "rightValue": "={{ '3'.toNumber() }}",
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -1840,
+        3632
+      ],
+      "id": "f3188968-781c-4def-853d-13841737300a",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json;\nconst query = src.query ?? {};\nconst body  = src.body ?? src;   // иногда body может быть сразу в корне\n\nconst tz = \"+05:00\";\n\nconst getQueryValue = (obj, wantedKey) => {\n  const keys = Reflect.ownKeys(obj).map(k => String(k));\n  const norm = (s) => s.toLowerCase().replace(/\\s+/g, '').replace(/-/g, '_');\n  const target = norm(wantedKey);\n  const realKey = keys.find(k => norm(k) === target);\n  return realKey ? obj[realKey] : null;\n};\n\n// ✅ user_id: BODY first, then QUERY\nconst userIdRaw =\n  body.user_id ?? body.userId ??\n  getQueryValue(query, \"user_id\") ??\n  getQueryValue(query, \"userId\") ??\n  null;\n\n// ✅ dates: BODY first, then QUERY\nconst startD = body.startTime ?? getQueryValue(query, \"startTime\") ?? null;\nconst endD   = body.endTime   ?? getQueryValue(query, \"endTime\")   ?? null;\n\nconst startTime = startD ? `${startD}T00:00:00${tz}` : null;\nconst endTime   = endD   ? `${endD}T23:59:59${tz}` : null;\n\nif (userIdRaw === null || userIdRaw === undefined || String(userIdRaw).trim() === \"\") {\n  return [{\n    json: {\n      error: \"user_id not found\",\n      debug: {\n        queryKeys: Reflect.ownKeys(query).map(k => String(k)),\n        bodyKeys: Reflect.ownKeys(body).map(k => String(k)),\n        query,\n        body\n      }\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    user_id: String(userIdRaw),\n    startTime,\n    endTime\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -960,
+        3568
+      ],
+      "id": "51fefec1-ee19-471d-a141-3fc4167955b1",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        2992,
+        3056
+      ],
+      "id": "f09db9eb-69ee-401c-9c40-b3c16ef057fa",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// === ИМЕНА НОД ===\nconst minNode = 'Code in JavaScript10'; // IN: { rows: [{date, first_in, inIp, employee_id, name, ...}] }\nconst maxNode = 'Code in JavaScript13'; // OUT: { rows: [{date, last_out, outIp, employee_id, name, ...}] }\n\n// === helpers ===\nconst cleanIp = (v) =>\n  (v == null) ? null : String(v)\n    .replace(/[\\u200B-\\u200D\\u2060\\uFEFF]/g, '') // zero-width chars\n    .replace(/\\s+/g, '')                        // пробелы/переводы строк\n    .trim();\n\nconst cleanDate = (v) =>\n  (v == null) ? null : String(v).trim().slice(0, 10);\n\n// === ЗАБИРАЕМ ДАННЫЕ (по 1 item) ===\nconst minWrap = $items(minNode)[0]?.json ?? {};\nconst maxWrap = $items(maxNode)[0]?.json ?? {};\n\nconst minRows = Array.isArray(minWrap.rows) ? minWrap.rows : [];\nconst maxRows = Array.isArray(maxWrap.rows) ? maxWrap.rows : [];\n\n// === СКЛЕИВАЕМ ПО ДАТЕ ===\nconst byDate = {};\n\n// входы (MIN)\nfor (const r of minRows) {\n  const date = cleanDate(r.date);\n  if (!date) continue;\n\n  if (!byDate[date]) byDate[date] = {};\n\n  // first_in: берём минимальный\n  if (r.first_in) {\n    if (!byDate[date].first_in || r.first_in < byDate[date].first_in) {\n      byDate[date].first_in = r.first_in;\n      byDate[date].inIp = cleanIp(r.inIp ?? r.device_ip ?? r.device_ip ?? null);\n    }\n  }\n\n  if (r.employee_id != null) byDate[date].employee_id = r.employee_id;\n  if (r.name != null) byDate[date].name = r.name;\n}\n\n// выходы (MAX)\nfor (const r of maxRows) {\n  const date = cleanDate(r.date);\n  if (!date) continue;\n\n  if (!byDate[date]) byDate[date] = {};\n\n  // last_out: берём максимальный\n  if (r.last_out) {\n    if (!byDate[date].last_out || r.last_out > byDate[date].last_out) {\n      byDate[date].last_out = r.last_out;\n      byDate[date].outIp = cleanIp(r.outIp ?? r.device_ip ?? null);\n    }\n  }\n\n  // если IN не дал — возьмём из OUT\n  if (byDate[date].employee_id == null && r.employee_id != null) byDate[date].employee_id = r.employee_id;\n  if (byDate[date].name == null && r.name != null) byDate[date].name = r.name;\n}\n\n// === ФОРМИРУЕМ РЕЗУЛЬТАТ ПО ДНЯМ ===\nconst days = Object.entries(byDate)\n  .map(([date, v]) => {\n    const first_in = v.first_in ?? null;\n    const last_out = v.last_out ?? null;\n\n    let status = \"ok\";\n    let message = \"OK\";\n\n    if (!first_in && !last_out) {\n      status = \"no_data\";\n      message = \"За день событий нет.\";\n    } else if (!first_in || !last_out) {\n      status = \"partial\";\n      message = \"Найден только вход или только выход.\";\n    }\n\n    return {\n      date,\n      employee_id: v.employee_id ?? null,\n      name: v.name ?? null,\n      first_in,\n      last_out,\n      inIp: cleanIp(v.inIp ?? null),\n      outIp: cleanIp(v.outIp ?? null),\n      status,\n      message\n    };\n  })\n  .sort((a, b) => (a.date < b.date ? -1 : 1));\n\n// === ОБЩИЙ СТАТУС ===\nlet overall_status = \"ok\";\nlet overall_message = \"OK\";\n\nif (!days.length) {\n  overall_status = \"no_data\";\n  overall_message = \"За период событий нет.\";\n} else if (days.some(d => d.status === \"partial\")) {\n  overall_status = \"partial\";\n  overall_message = \"Данные за период получены частично.\";\n}\n\nreturn [{\n  json: {\n    status: overall_status,\n    message: overall_message,\n    days,\n    debug: {\n      in_rows: minRows.length,\n      out_rows: maxRows.length,\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2768,
+        3056
+      ],
+      "id": "f5602af7-47bb-4125-bb9a-a8e96ea413c9",
+      "name": "Code in JavaScript9"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -512,
+        3568
+      ],
+      "id": "5d3e4688-3f3b-4407-8dc8-5a81c533bc1f",
+      "name": "Loop Over Items2"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "name": "Replace Me2",
+      "typeVersion": 1,
+      "position": [
+        912,
+        4000
+      ],
+      "id": "3805f573-2b72-413d-9c19-56be3c6faa74"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "EsHCGpIGduk0gZ44",
+          "mode": "list",
+          "cachedResultName": "int2",
+          "cachedResultUrl": "/projects/TmNIdtTy7ks3j2lE/datatables/EsHCGpIGduk0gZ44"
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        -736,
+        3568
+      ],
+      "id": "6e4b9169-c671-4e5c-bf2e-ee24a370b919",
+      "name": "Get row(s)2"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.all().map(i => i.json);\n\n// разворачиваем: device -> days[]\nconst rows = [];\n\nfor (const r of raw) {\n  const deviceIp = r.device_ip ?? r.deviceIp ?? r.ip ?? null;\n\n  const days = Array.isArray(r.days) ? r.days : [];\n  if (!days.length) {\n    // если хочешь видеть строки даже когда данных нет — раскомментируй:\n    // rows.push({\n    //   device_ip: deviceIp,\n    //   status: r.status ?? null,\n    //   message: r.message ?? null,\n    //   date: null,\n    //   first_in: null,\n    //   employee_id: null,\n    //   name: null,\n    // });\n    continue;\n  }\n\n  for (const d of days) {\n    rows.push({\n      device_ip: deviceIp,\n      status: r.status ?? null,\n      message: r.message ?? null,\n\n      date: d.date ?? null,\n      first_in: d.first_in ?? null,\n      employee_id: d.employee_id ?? null,\n      name: d.name ?? null,\n\n      inIp: d.inIp ?? deviceIp, // на всякий\n    });\n  }\n}\n\nreturn [{\n  json: {\n    rows,\n    count: rows.length,\n    devices_count: raw.length,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -64,
+        3168
+      ],
+      "id": "128f8b85-5324-4a81-bcee-3c7dda0b64e1",
+      "name": "Code in JavaScript10"
+    },
+    {
+      "parameters": {
+        "url": "=http://{{ $('Loop Over Items2').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Connection",
+              "value": "keep-alive"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -224,
+        3648
+      ],
+      "id": "b66c0f99-edcc-47fe-8f6d-017f957f7b9b",
+      "name": "Запрос токена",
+      "alwaysOutputData": false,
+      "executeOnce": false,
+      "notesInFlow": false,
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ======= Чистая реализация MD5 (без внешних библиотек) =======\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n\n  /* -- подготовка строки -- */\n  const u8 = unescape(encodeURIComponent(str));           // UTF-8\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;             // кратно 16\n  const X = new Array(nWords).fill(0);\n\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n\n  /* -- начальные константы -- */\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n\n  /* -- основной цикл -- */\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478);   d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB);  b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF);   d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613);  b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8);   d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i +10], 17, 0xFFFF5BB1);  b = FF(b, c, d, a, X[i +11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i +12], 7, 0x6B901122);   d = FF(d, a, b, c, X[i +13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i +14], 17, 0xA679438E);  b = FF(b, c, d, a, X[i +15], 22, 0x49B40821);\n\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562);   d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i +11],14, 0x265E5A51);   b = GG(b, c, d, a, X[i + 0],20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D);   d = GG(d, a, b, c, X[i +10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i +15],14, 0xD8A1E681);   b = GG(b, c, d, a, X[i + 4],20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6);   d = GG(d, a, b, c, X[i +14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3],14, 0xF4D50D87);   b = GG(b, c, d, a, X[i + 8],20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i +13], 5, 0xA9E3E905);   d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7],14, 0x676F02D9);   b = GG(b, c, d, a, X[i +12],20, 0x8D2A4C8A);\n\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942);   d = HH(d, a, b, c, X[i + 8],11, 0x8771F681);\n    c = HH(c, d, a, b, X[i +11],16, 0x6D9D6122);   b = HH(b, c, d, a, X[i +14],23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44);   d = HH(d, a, b, c, X[i + 4],11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7],16, 0xF6BB4B60);   b = HH(b, c, d, a, X[i +10],23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i +13], 4, 0x289B7EC6);   d = HH(d, a, b, c, X[i + 0],11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3],16, 0xD4EF3085);   b = HH(b, c, d, a, X[i + 6],23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039);   d = HH(d, a, b, c, X[i +12],11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i +15],16, 0x1FA27CF8);   b = HH(b, c, d, a, X[i + 2],23, 0xC4AC5665);\n\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244);   d = II(d, a, b, c, X[i + 7],10, 0x432AFF97);\n    c = II(c, d, a, b, X[i +14],15, 0xAB9423A7);   b = II(b, c, d, a, X[i + 5],21, 0xFC93A039);\n    a = II(a, b, c, d, X[i +12], 6, 0x655B59C3);   d = II(d, a, b, c, X[i + 3],10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i +10],15, 0xFFEFF47D);   b = II(b, c, d, a, X[i + 1],21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F);   d = II(d, a, b, c, X[i +15],10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6],15, 0xA3014314);   b = II(b, c, d, a, X[i +13],21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82);   d = II(d, a, b, c, X[i +11],10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2],15, 0x2AD7D2BB);   b = II(b, c, d, a, X[i + 9],21, 0xEB86D391);\n\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n\n  const hexLE = (w) =>\n    ('0' + ( w        & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >>  8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\n// ======= Digest Auth генерируется ниже =======\nconst username = 'admin';\nconst password = 'WPvH93sqmY';\nconst method = 'POST';\nconst uri = '/ISAPI/AccessControl/AcsEvent?format=json';\nconst body = '<RemoteControlDoor><cmd>open</cmd></RemoteControlDoor>';\n\n\nconst wwwAuth = $input.first().json.headers['www-authenticate'];\nconst realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)[1];\n\nconst nc     = '00000001';\nconst cnonce = '8vNMwecd';              // фиксированный — получим тот же response\n\nconst ha1 = md5(`${username}:${realm}:${password}`);\nconst ha2 = md5(`${method}:${uri}`);\nconst response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);\n\nconst authHeader =\n  `Digest username=\"${username}\",realm=\"${realm}\",nonce=\"${nonce}\",` +\n  `uri=\"${uri}\",algorithm=\"MD5\",qop=${qop},nc=${nc},` +\n  `cnonce=\"${cnonce}\",response=\"${response}\"`;\n\nreturn { authHeader };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        3648
+      ],
+      "id": "0e35ae65-7725-43d2-8ef4-793239068f5f",
+      "name": "Шифрование",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $('Loop Over Items2').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $json.authHeader }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"AcsEventCond\": {\n    \"searchID\": \"in_{{$execution.id}}\",\n    \"searchResultPosition\": 0,\n    \"maxResults\": 200,\n    \"major\": 5,\n    \"minor\": 75,\n    \"startTime\": \"{{ $('Code in JavaScript').item.json.startTime }}\",\n    \"endTime\": \"{{ $('Code in JavaScript').item.json.endTime }}\",\n    \"employeeNoString\": \"{{ $('Code in JavaScript').item.json.user_id }}\"\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        208,
+        3648
+      ],
+      "id": "bcda15e9-8ce0-440b-9298-7d0ceaea2141",
+      "name": "Регистрация пользователя",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n  const u8 = unescape(encodeURIComponent(str));\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;\n  const X = new Array(nWords).fill(0);\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478); d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB); b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF); d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613); b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8); d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i + 10], 17, 0xFFFF5BB1); b = FF(b, c, d, a, X[i + 11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i + 12], 7, 0x6B901122); d = FF(d, a, b, c, X[i + 13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i + 14], 17, 0xA679438E); b = FF(b, c, d, a, X[i + 15], 22, 0x49B40821);\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562); d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i + 11], 14, 0x265E5A51); b = GG(b, c, d, a, X[i + 0], 20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D); d = GG(d, a, b, c, X[i + 10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i + 15], 14, 0xD8A1E681); b = GG(b, c, d, a, X[i + 4], 20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6); d = GG(d, a, b, c, X[i + 14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3], 14, 0xF4D50D87); b = GG(b, c, d, a, X[i + 8], 20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i + 13], 5, 0xA9E3E905); d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7], 14, 0x676F02D9); b = GG(b, c, d, a, X[i + 12], 20, 0x8D2A4C8A);\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942); d = HH(d, a, b, c, X[i + 8], 11, 0x8771F681);\n    c = HH(c, d, a, b, X[i + 11], 16, 0x6D9D6122); b = HH(b, c, d, a, X[i + 14], 23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44); d = HH(d, a, b, c, X[i + 4], 11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7], 16, 0xF6BB4B60); b = HH(b, c, d, a, X[i + 10], 23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i + 13], 4, 0x289B7EC6); d = HH(d, a, b, c, X[i + 0], 11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3], 16, 0xD4EF3085); b = HH(b, c, d, a, X[i + 6], 23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039); d = HH(d, a, b, c, X[i + 12], 11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i + 15], 16, 0x1FA27CF8); b = HH(b, c, d, a, X[i + 2], 23, 0xC4AC5665);\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244); d = II(d, a, b, c, X[i + 7], 10, 0x432AFF97);\n    c = II(c, d, a, b, X[i + 14], 15, 0xAB9423A7); b = II(b, c, d, a, X[i + 5], 21, 0xFC93A039);\n    a = II(a, b, c, d, X[i + 12], 6, 0x655B59C3); d = II(d, a, b, c, X[i + 3], 10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i + 10], 15, 0xFFEFF47D); b = II(b, c, d, a, X[i + 1], 21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F); d = II(d, a, b, c, X[i + 15], 10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6], 15, 0xA3014314); b = II(b, c, d, a, X[i + 13], 21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82); d = II(d, a, b, c, X[i + 11], 10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2], 15, 0x2AD7D2BB); b = II(b, c, d, a, X[i + 9], 21, 0xEB86D391);\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n  const hexLE = (w) =>\n    ('0' + (w & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\nfunction digestHeader(wwwAuth, username, password, method, uri) {\n  const realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)?.[1] ?? 'auth';\n  if (!realm || !nonce) throw new Error('Digest challenge is missing realm or nonce');\n  const nc = '00000001';\n  const cnonce = Math.random().toString(36).slice(2, 10);\n  const ha1 = md5(username + ':' + realm + ':' + password);\n  const ha2 = md5(method + ':' + uri);\n  const response = md5(ha1 + ':' + nonce + ':' + nc + ':' + cnonce + ':' + qop + ':' + ha2);\n  return 'Digest username=\"' + username + '\",realm=\"' + realm + '\",nonce=\"' + nonce + '\",uri=\"' + uri + '\",algorithm=\"MD5\",qop=' + qop + ',nc=' + nc + ',cnonce=\"' + cnonce + '\",response=\"' + response + '\"';\n}\n\nasync function httpJson(options) {\n  const response = await this.helpers.httpRequest({\n    ...options,\n    json: true,\n    simple: false,\n    resolveWithFullResponse: true,\n    returnFullResponse: true,\n    ignoreHttpStatusErrors: true,\n  });\n\n  let body = response.body ?? null;\n  if (typeof body === 'string') {\n    try { body = JSON.parse(body); } catch (e) {}\n  }\n\n  return {\n    statusCode: response.statusCode ?? response.status ?? 0,\n    headers: response.headers ?? {},\n    body,\n  };\n}\n\nfunction getHeader(headers, name) {\n  const target = name.toLowerCase();\n  const key = Object.keys(headers ?? {}).find((k) => k.toLowerCase() === target);\n  return key ? headers[key] : null;\n}\n\nasync function fetchAcsEventsPaged(deviceIp, { startTime, endTime, userId, searchPrefix }) {\n  const username = 'admin';\n  const password = 'WPvH93sqmY';\n  const uri = '/ISAPI/AccessControl/AcsEvent?format=json';\n  const url = 'http://' + deviceIp + uri;\n  const pageSize = 200;\n  const maxPages = 50;\n\n  const challenge = await httpJson.call(this, { method: 'GET', url, headers: { Connection: 'keep-alive' } });\n  const wwwAuth = getHeader(challenge.headers, 'www-authenticate');\n  if (!wwwAuth) {\n    throw new Error('Device ' + deviceIp + ' did not return digest challenge, status ' + challenge.statusCode);\n  }\n\n  const all = [];\n  for (let page = 0; page < maxPages; page++) {\n    const position = page * pageSize;\n    const body = {\n      AcsEventCond: {\n        searchID: searchPrefix + '_' + $execution.id + '_' + deviceIp + '_' + page,\n        searchResultPosition: position,\n        maxResults: pageSize,\n        major: 5,\n        minor: 75,\n        startTime,\n        endTime,\n        employeeNoString: String(userId),\n      },\n    };\n\n    const authHeader = digestHeader(wwwAuth, username, password, 'POST', uri);\n    const resp = await httpJson.call(this, {\n      method: 'POST',\n      url,\n      headers: {\n        Authorization: authHeader,\n        'Content-Type': 'application/json',\n      },\n      body,\n    });\n\n    if (resp.statusCode >= 400) {\n      throw new Error('Device ' + deviceIp + ' returned HTTP ' + resp.statusCode + ' at position ' + position);\n    }\n\n    const list = resp.body?.AcsEvent?.InfoList ?? [];\n    all.push(...list);\n\n    const total = Number(resp.body?.AcsEvent?.totalMatches ?? resp.body?.AcsEvent?.numOfMatches ?? NaN);\n    if (list.length < pageSize) break;\n    if (Number.isFinite(total) && position + list.length >= total) break;\n  }\n\n  return all;\n}\n\nfunction dayRanges(startTime, endTime) {\n  const startDate = startTime.slice(0, 10);\n  const endDate = endTime.slice(0, 10);\n  const tz = startTime.slice(19) || '+05:00';\n\n  const result = [];\n  let d = new Date(startDate + 'T00:00:00Z');\n  const end = new Date(endDate + 'T00:00:00Z');\n\n  while (d <= end) {\n    const yyyy = d.getUTCFullYear();\n    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');\n    const dd = String(d.getUTCDate()).padStart(2, '0');\n    const date = yyyy + '-' + mm + '-' + dd;\n\n    result.push({\n      date,\n      startTime: date + 'T00:00:00' + tz,\n      endTime: date + 'T23:59:59' + tz,\n    });\n\n    d.setUTCDate(d.getUTCDate() + 1);\n  }\n\n  return result;\n}\n\nconst meta = $('Loop Over Items2').item.json ?? $json ?? {};\nconst deviceIp = meta.ip ?? meta.device_ip ?? null;\nconst params = $items('Code in JavaScript')[0].json;\n\ntry {\n  const allEvents = [];\n\n  for (const range of dayRanges(params.startTime, params.endTime)) {\n    const list = await fetchAcsEventsPaged.call(this, deviceIp, {\n      startTime: range.startTime,\n      endTime: range.endTime,\n      userId: params.user_id,\n      searchPrefix: 'in_' + range.date,\n    });\n\n    allEvents.push(...list);\n  }\n\n  const events = allEvents.filter((e) =>\n    e.major === 5 &&\n    e.minor === 75 &&\n    e.time &&\n    String(e.employeeNoString) === String(params.user_id)\n  );\n\n  const byDay = {};\n  for (const e of events) {\n    const date = e.time.slice(0, 10);\n    if (!byDay[date]) byDay[date] = [];\n    byDay[date].push(e);\n  }\n\n  const days = Object.entries(byDay).map(([date, arr]) => {\n    let first = arr[0];\n    let minMs = new Date(first.time).getTime();\n\n    for (const e of arr) {\n      const ms = new Date(e.time).getTime();\n      if (ms < minMs) {\n        first = e;\n        minMs = ms;\n      }\n    }\n\n    return {\n      date,\n      first_in: first.time,\n      employee_id: first.employeeNoString ?? null,\n      name: first.name ?? null,\n      inIp: deviceIp,\n    };\n  });\n\n  return [{\n    json: {\n      status: days.length ? 'ok' : 'no_data',\n      message: days.length ? 'OK' : 'За указанный период событий нет',\n      device_ip: deviceIp,\n      days,\n      pages_mode: 'daily',\n      raw_events: events.length,\n    },\n  }];\n} catch (error) {\n  return [{\n    json: {\n      status: 'device_error',\n      message: error.message,\n      device_ip: deviceIp,\n      days: [],\n    },\n  }];\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        3648
+      ],
+      "id": "8663541a-6709-4f33-babf-86b3c4cc20a9",
+      "name": "Code in JavaScript11"
+    },
+    {
+      "parameters": {
+        "content": "## Минимальный вход \n",
+        "height": 256,
+        "width": 928
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -272,
+        3584
+      ],
+      "typeVersion": 1,
+      "id": "dab81a1b-6a89-4ed1-9000-c2f90417634d",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1744,
+        3504
+      ],
+      "id": "2a09d67b-ffa7-49b5-a9d3-204e80f0a90b",
+      "name": "Loop Over Items3"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "name": "Replace Me3",
+      "typeVersion": 1,
+      "position": [
+        3168,
+        3936
+      ],
+      "id": "6f9313f7-be59-4f02-833d-b787b4fd8053"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "yMarIejwGo6U3s68",
+          "mode": "list",
+          "cachedResultName": "out2",
+          "cachedResultUrl": "/projects/TmNIdtTy7ks3j2lE/datatables/yMarIejwGo6U3s68"
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1520,
+        3504
+      ],
+      "id": "5ad45901-6512-413d-b92f-aef4973abc5e",
+      "name": "Get row(s)3"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.all().map(i => i.json);\n\nconst rows = [];\n\nfor (const r of raw) {\n  const deviceIp = r.device_ip ?? r.deviceIp ?? r.ip ?? null;\n  const days = Array.isArray(r.days) ? r.days : [];\n\n  for (const d of days) {\n    rows.push({\n      device_ip: deviceIp,\n      status: r.status ?? null,\n      message: r.message ?? null,\n\n      date: d.date ?? null,\n\n      // IN\n      first_in: d.first_in ?? null,\n      inIp: d.inIp ?? null,\n\n      // OUT\n      last_out: d.last_out ?? null,\n      outIp: d.outIp ?? null,\n\n      // common\n      employee_id: d.employee_id ?? null,\n      name: d.name ?? null,\n    });\n  }\n\n  // если нужно видеть устройства без событий — добавь пустую строку\n  // if (!days.length) {\n  //   rows.push({\n  //     device_ip: deviceIp,\n  //     status: r.status ?? null,\n  //     message: r.message ?? null,\n  //     date: null,\n  //     first_in: null,\n  //     last_out: null,\n  //     employee_id: null,\n  //     name: null,\n  //     inIp: null,\n  //     outIp: null,\n  //   });\n  // }\n}\n\nreturn [{\n  json: {\n    rows,\n    count: rows.length,\n    devices_count: raw.length,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2192,
+        3104
+      ],
+      "id": "099ef3bd-91d3-4af4-b1ba-d89d82b94a5f",
+      "name": "Code in JavaScript12"
+    },
+    {
+      "parameters": {
+        "url": "=http://{{ $('Loop Over Items3').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Connection",
+              "value": "keep-alive"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        3648
+      ],
+      "id": "33f927c1-ec57-4986-9479-cad58448a42c",
+      "name": "Запрос токена4",
+      "alwaysOutputData": false,
+      "executeOnce": false,
+      "notesInFlow": false,
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ======= Чистая реализация MD5 (без внешних библиотек) =======\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n\n  /* -- подготовка строки -- */\n  const u8 = unescape(encodeURIComponent(str));           // UTF-8\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;             // кратно 16\n  const X = new Array(nWords).fill(0);\n\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n\n  /* -- начальные константы -- */\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n\n  /* -- основной цикл -- */\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478);   d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB);  b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF);   d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613);  b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8);   d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i +10], 17, 0xFFFF5BB1);  b = FF(b, c, d, a, X[i +11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i +12], 7, 0x6B901122);   d = FF(d, a, b, c, X[i +13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i +14], 17, 0xA679438E);  b = FF(b, c, d, a, X[i +15], 22, 0x49B40821);\n\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562);   d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i +11],14, 0x265E5A51);   b = GG(b, c, d, a, X[i + 0],20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D);   d = GG(d, a, b, c, X[i +10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i +15],14, 0xD8A1E681);   b = GG(b, c, d, a, X[i + 4],20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6);   d = GG(d, a, b, c, X[i +14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3],14, 0xF4D50D87);   b = GG(b, c, d, a, X[i + 8],20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i +13], 5, 0xA9E3E905);   d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7],14, 0x676F02D9);   b = GG(b, c, d, a, X[i +12],20, 0x8D2A4C8A);\n\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942);   d = HH(d, a, b, c, X[i + 8],11, 0x8771F681);\n    c = HH(c, d, a, b, X[i +11],16, 0x6D9D6122);   b = HH(b, c, d, a, X[i +14],23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44);   d = HH(d, a, b, c, X[i + 4],11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7],16, 0xF6BB4B60);   b = HH(b, c, d, a, X[i +10],23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i +13], 4, 0x289B7EC6);   d = HH(d, a, b, c, X[i + 0],11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3],16, 0xD4EF3085);   b = HH(b, c, d, a, X[i + 6],23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039);   d = HH(d, a, b, c, X[i +12],11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i +15],16, 0x1FA27CF8);   b = HH(b, c, d, a, X[i + 2],23, 0xC4AC5665);\n\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244);   d = II(d, a, b, c, X[i + 7],10, 0x432AFF97);\n    c = II(c, d, a, b, X[i +14],15, 0xAB9423A7);   b = II(b, c, d, a, X[i + 5],21, 0xFC93A039);\n    a = II(a, b, c, d, X[i +12], 6, 0x655B59C3);   d = II(d, a, b, c, X[i + 3],10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i +10],15, 0xFFEFF47D);   b = II(b, c, d, a, X[i + 1],21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F);   d = II(d, a, b, c, X[i +15],10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6],15, 0xA3014314);   b = II(b, c, d, a, X[i +13],21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82);   d = II(d, a, b, c, X[i +11],10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2],15, 0x2AD7D2BB);   b = II(b, c, d, a, X[i + 9],21, 0xEB86D391);\n\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n\n  const hexLE = (w) =>\n    ('0' + ( w        & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >>  8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\n// ======= Digest Auth генерируется ниже =======\nconst username = 'admin';\nconst password = 'WPvH93sqmY';\nconst method = 'POST';\nconst uri = '/ISAPI/AccessControl/AcsEvent?format=json';\nconst body = '<RemoteControlDoor><cmd>open</cmd></RemoteControlDoor>';\n\n\nconst wwwAuth = $input.first().json.headers['www-authenticate'];\nconst realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)[1];\n\nconst nc     = '00000001';\nconst cnonce = '8vNMwecd';              // фиксированный — получим тот же response\n\nconst ha1 = md5(`${username}:${realm}:${password}`);\nconst ha2 = md5(`${method}:${uri}`);\nconst response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);\n\nconst authHeader =\n  `Digest username=\"${username}\",realm=\"${realm}\",nonce=\"${nonce}\",` +\n  `uri=\"${uri}\",algorithm=\"MD5\",qop=${qop},nc=${nc},` +\n  `cnonce=\"${cnonce}\",response=\"${response}\"`;\n\nreturn { authHeader };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2384,
+        3648
+      ],
+      "id": "1763ccd8-5927-4191-85bb-5b83e96249be",
+      "name": "Шифрование4",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $('Loop Over Items3').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $json.authHeader }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"AcsEventCond\": {\n    \"searchID\": \"in_{{$execution.id}}\",\n    \"searchResultPosition\": 0,\n    \"maxResults\": 200,\n    \"major\": 5,\n    \"minor\": 75,\n\"startTime\": \"{{ $items('Code in JavaScript')[0].json.startTime }}\",\n\"endTime\":   \"{{ $items('Code in JavaScript')[0].json.endTime }}\",\n\"employeeNoString\": \"{{ $items('Code in JavaScript')[0].json.user_id }}\"\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2592,
+        3648
+      ],
+      "id": "8075c8f3-2e1f-4bf8-91dd-5a7bb9c22e69",
+      "name": "Регистрация пользователя4",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n  const u8 = unescape(encodeURIComponent(str));\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;\n  const X = new Array(nWords).fill(0);\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478); d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB); b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF); d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613); b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8); d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i + 10], 17, 0xFFFF5BB1); b = FF(b, c, d, a, X[i + 11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i + 12], 7, 0x6B901122); d = FF(d, a, b, c, X[i + 13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i + 14], 17, 0xA679438E); b = FF(b, c, d, a, X[i + 15], 22, 0x49B40821);\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562); d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i + 11], 14, 0x265E5A51); b = GG(b, c, d, a, X[i + 0], 20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D); d = GG(d, a, b, c, X[i + 10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i + 15], 14, 0xD8A1E681); b = GG(b, c, d, a, X[i + 4], 20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6); d = GG(d, a, b, c, X[i + 14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3], 14, 0xF4D50D87); b = GG(b, c, d, a, X[i + 8], 20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i + 13], 5, 0xA9E3E905); d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7], 14, 0x676F02D9); b = GG(b, c, d, a, X[i + 12], 20, 0x8D2A4C8A);\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942); d = HH(d, a, b, c, X[i + 8], 11, 0x8771F681);\n    c = HH(c, d, a, b, X[i + 11], 16, 0x6D9D6122); b = HH(b, c, d, a, X[i + 14], 23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44); d = HH(d, a, b, c, X[i + 4], 11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7], 16, 0xF6BB4B60); b = HH(b, c, d, a, X[i + 10], 23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i + 13], 4, 0x289B7EC6); d = HH(d, a, b, c, X[i + 0], 11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3], 16, 0xD4EF3085); b = HH(b, c, d, a, X[i + 6], 23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039); d = HH(d, a, b, c, X[i + 12], 11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i + 15], 16, 0x1FA27CF8); b = HH(b, c, d, a, X[i + 2], 23, 0xC4AC5665);\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244); d = II(d, a, b, c, X[i + 7], 10, 0x432AFF97);\n    c = II(c, d, a, b, X[i + 14], 15, 0xAB9423A7); b = II(b, c, d, a, X[i + 5], 21, 0xFC93A039);\n    a = II(a, b, c, d, X[i + 12], 6, 0x655B59C3); d = II(d, a, b, c, X[i + 3], 10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i + 10], 15, 0xFFEFF47D); b = II(b, c, d, a, X[i + 1], 21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F); d = II(d, a, b, c, X[i + 15], 10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6], 15, 0xA3014314); b = II(b, c, d, a, X[i + 13], 21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82); d = II(d, a, b, c, X[i + 11], 10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2], 15, 0x2AD7D2BB); b = II(b, c, d, a, X[i + 9], 21, 0xEB86D391);\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n  const hexLE = (w) =>\n    ('0' + (w & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\nfunction digestHeader(wwwAuth, username, password, method, uri) {\n  const realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)?.[1] ?? 'auth';\n  if (!realm || !nonce) throw new Error('Digest challenge is missing realm or nonce');\n  const nc = '00000001';\n  const cnonce = Math.random().toString(36).slice(2, 10);\n  const ha1 = md5(username + ':' + realm + ':' + password);\n  const ha2 = md5(method + ':' + uri);\n  const response = md5(ha1 + ':' + nonce + ':' + nc + ':' + cnonce + ':' + qop + ':' + ha2);\n  return 'Digest username=\"' + username + '\",realm=\"' + realm + '\",nonce=\"' + nonce + '\",uri=\"' + uri + '\",algorithm=\"MD5\",qop=' + qop + ',nc=' + nc + ',cnonce=\"' + cnonce + '\",response=\"' + response + '\"';\n}\n\nasync function httpJson(options) {\n  const response = await this.helpers.httpRequest({\n    ...options,\n    json: true,\n    simple: false,\n    resolveWithFullResponse: true,\n    returnFullResponse: true,\n    ignoreHttpStatusErrors: true,\n  });\n\n  let body = response.body ?? null;\n  if (typeof body === 'string') {\n    try { body = JSON.parse(body); } catch (e) {}\n  }\n\n  return {\n    statusCode: response.statusCode ?? response.status ?? 0,\n    headers: response.headers ?? {},\n    body,\n  };\n}\n\nfunction getHeader(headers, name) {\n  const target = name.toLowerCase();\n  const key = Object.keys(headers ?? {}).find((k) => k.toLowerCase() === target);\n  return key ? headers[key] : null;\n}\n\nasync function fetchAcsEventsPaged(deviceIp, { startTime, endTime, userId, searchPrefix }) {\n  const username = 'admin';\n  const password = 'WPvH93sqmY';\n  const uri = '/ISAPI/AccessControl/AcsEvent?format=json';\n  const url = 'http://' + deviceIp + uri;\n  const pageSize = 200;\n  const maxPages = 50;\n\n  const challenge = await httpJson.call(this, { method: 'GET', url, headers: { Connection: 'keep-alive' } });\n  const wwwAuth = getHeader(challenge.headers, 'www-authenticate');\n  if (!wwwAuth) {\n    throw new Error('Device ' + deviceIp + ' did not return digest challenge, status ' + challenge.statusCode);\n  }\n\n  const all = [];\n  for (let page = 0; page < maxPages; page++) {\n    const position = page * pageSize;\n    const body = {\n      AcsEventCond: {\n        searchID: searchPrefix + '_' + $execution.id + '_' + deviceIp + '_' + page,\n        searchResultPosition: position,\n        maxResults: pageSize,\n        major: 5,\n        minor: 75,\n        startTime,\n        endTime,\n        employeeNoString: String(userId),\n      },\n    };\n\n    const authHeader = digestHeader(wwwAuth, username, password, 'POST', uri);\n    const resp = await httpJson.call(this, {\n      method: 'POST',\n      url,\n      headers: {\n        Authorization: authHeader,\n        'Content-Type': 'application/json',\n      },\n      body,\n    });\n\n    if (resp.statusCode >= 400) {\n      throw new Error('Device ' + deviceIp + ' returned HTTP ' + resp.statusCode + ' at position ' + position);\n    }\n\n    const list = resp.body?.AcsEvent?.InfoList ?? [];\n    all.push(...list);\n\n    const total = Number(resp.body?.AcsEvent?.totalMatches ?? resp.body?.AcsEvent?.numOfMatches ?? NaN);\n    if (list.length < pageSize) break;\n    if (Number.isFinite(total) && position + list.length >= total) break;\n  }\n\n  return all;\n}\n\nfunction dayRanges(startTime, endTime) {\n  const startDate = startTime.slice(0, 10);\n  const endDate = endTime.slice(0, 10);\n  const tz = startTime.slice(19) || '+05:00';\n\n  const result = [];\n  let d = new Date(startDate + 'T00:00:00Z');\n  const end = new Date(endDate + 'T00:00:00Z');\n\n  while (d <= end) {\n    const yyyy = d.getUTCFullYear();\n    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');\n    const dd = String(d.getUTCDate()).padStart(2, '0');\n    const date = yyyy + '-' + mm + '-' + dd;\n\n    result.push({\n      date,\n      startTime: date + 'T00:00:00' + tz,\n      endTime: date + 'T23:59:59' + tz,\n    });\n\n    d.setUTCDate(d.getUTCDate() + 1);\n  }\n\n  return result;\n}\n\nconst meta = $('Loop Over Items3').item.json ?? $json ?? {};\nconst deviceIp = meta.ip ?? meta.device_ip ?? null;\nconst params = $items('Code in JavaScript')[0].json;\n\ntry {\n  const allEvents = [];\n\n  for (const range of dayRanges(params.startTime, params.endTime)) {\n    const list = await fetchAcsEventsPaged.call(this, deviceIp, {\n      startTime: range.startTime,\n      endTime: range.endTime,\n      userId: params.user_id,\n      searchPrefix: 'out_' + range.date,\n    });\n\n    allEvents.push(...list);\n  }\n\n  const events = allEvents.filter((e) =>\n    e.major === 5 &&\n    e.minor === 75 &&\n    e.time &&\n    String(e.employeeNoString) === String(params.user_id)\n  );\n\n  if (!events.length) {\n    return [{\n      json: {\n        status: 'no_data',\n        message: 'На выходном домофоне нет событий за выбранный период',\n        device_ip: deviceIp,\n        days: [],\n        pages_mode: 'daily',\n        raw_events: 0,\n      },\n    }];\n  }\n\n  const byDay = {};\n  for (const e of events) {\n    const date = e.time.slice(0, 10);\n    if (!byDay[date]) byDay[date] = [];\n    byDay[date].push(e);\n  }\n\n  const days = Object.entries(byDay).map(([date, arr]) => {\n    let last = arr[0];\n    let maxMs = new Date(last.time).getTime();\n\n    for (const e of arr) {\n      const ms = new Date(e.time).getTime();\n      if (ms > maxMs) {\n        last = e;\n        maxMs = ms;\n      }\n    }\n\n    return {\n      date,\n      last_out: last.time,\n      employee_id: last.employeeNoString ?? null,\n      name: last.name ?? null,\n      outIp: deviceIp,\n    };\n  });\n\n  return [{\n    json: {\n      status: 'ok',\n      message: 'OK',\n      device_ip: deviceIp,\n      days,\n      pages_mode: 'daily',\n      raw_events: events.length,\n    },\n  }];\n} catch (error) {\n  return [{\n    json: {\n      status: 'device_error',\n      message: error.message,\n      device_ip: deviceIp,\n      days: [],\n    },\n  }];\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2832,
+        3648
+      ],
+      "id": "e4227b44-40ac-4e5d-a148-9a45d386ba6b",
+      "name": "Code in JavaScript13"
+    },
+    {
+      "parameters": {
+        "content": "## Максимальный выход\n",
+        "height": 256,
+        "width": 832,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2144,
+        3584
+      ],
+      "typeVersion": 1,
+      "id": "26a7fb16-1630-4542-8d38-018613358ab7",
+      "name": "Sticky Note4"
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $input.first().json;\nconst query = src.query ?? {};\nconst body  = src.body ?? src;   // иногда body может быть сразу в корне\n\nconst tz = \"+05:00\";\n\nconst getQueryValue = (obj, wantedKey) => {\n  const keys = Reflect.ownKeys(obj).map(k => String(k));\n  const norm = (s) => s.toLowerCase().replace(/\\s+/g, '').replace(/-/g, '_');\n  const target = norm(wantedKey);\n  const realKey = keys.find(k => norm(k) === target);\n  return realKey ? obj[realKey] : null;\n};\n\n// ✅ user_id: BODY first, then QUERY\nconst userIdRaw =\n  body.user_id ?? body.userId ??\n  getQueryValue(query, \"user_id\") ??\n  getQueryValue(query, \"userId\") ??\n  null;\n\n// ✅ dates: BODY first, then QUERY\nconst startD = body.startTime ?? getQueryValue(query, \"startTime\") ?? null;\nconst endD   = body.endTime   ?? getQueryValue(query, \"endTime\")   ?? null;\n\nconst startTime = startD ? `${startD}T00:00:00${tz}` : null;\nconst endTime   = endD   ? `${endD}T23:59:59${tz}` : null;\n\nif (userIdRaw === null || userIdRaw === undefined || String(userIdRaw).trim() === \"\") {\n  return [{\n    json: {\n      error: \"user_id not found\",\n      debug: {\n        queryKeys: Reflect.ownKeys(query).map(k => String(k)),\n        bodyKeys: Reflect.ownKeys(body).map(k => String(k)),\n        query,\n        body\n      }\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    user_id: String(userIdRaw),\n    startTime,\n    endTime\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -848,
+        5952
+      ],
+      "id": "99242b0c-5480-4b2e-a075-e6ad3a4329be",
+      "name": "Code in JavaScript14"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        3104,
+        5440
+      ],
+      "id": "5df1ba33-2c30-4ba9-946d-1aad24d01da3",
+      "name": "Respond to Webhook2"
+    },
+    {
+      "parameters": {
+        "jsCode": "// === ИМЕНА НОД ===\nconst minNode = 'Code in JavaScript16'; // IN: { rows: [{date, first_in, inIp, employee_id, name, ...}] }\nconst maxNode = 'Code in JavaScript18'; // OUT: { rows: [{date, last_out, outIp, employee_id, name, ...}] }\n\n// === helpers ===\nconst cleanIp = (v) =>\n  (v == null) ? null : String(v)\n    .replace(/[\\u200B-\\u200D\\u2060\\uFEFF]/g, '') // zero-width chars\n    .replace(/\\s+/g, '')                        // пробелы/переводы строк\n    .trim();\n\nconst cleanDate = (v) =>\n  (v == null) ? null : String(v).trim().slice(0, 10);\n\n// === ЗАБИРАЕМ ДАННЫЕ (по 1 item) ===\nconst minWrap = $items(minNode)[0]?.json ?? {};\nconst maxWrap = $items(maxNode)[0]?.json ?? {};\n\nconst minRows = Array.isArray(minWrap.rows) ? minWrap.rows : [];\nconst maxRows = Array.isArray(maxWrap.rows) ? maxWrap.rows : [];\n\n// === СКЛЕИВАЕМ ПО ДАТЕ ===\nconst byDate = {};\n\n// входы (MIN)\nfor (const r of minRows) {\n  const date = cleanDate(r.date);\n  if (!date) continue;\n\n  if (!byDate[date]) byDate[date] = {};\n\n  // first_in: берём минимальный\n  if (r.first_in) {\n    if (!byDate[date].first_in || r.first_in < byDate[date].first_in) {\n      byDate[date].first_in = r.first_in;\n      byDate[date].inIp = cleanIp(r.inIp ?? r.device_ip ?? r.device_ip ?? null);\n    }\n  }\n\n  if (r.employee_id != null) byDate[date].employee_id = r.employee_id;\n  if (r.name != null) byDate[date].name = r.name;\n}\n\n// выходы (MAX)\nfor (const r of maxRows) {\n  const date = cleanDate(r.date);\n  if (!date) continue;\n\n  if (!byDate[date]) byDate[date] = {};\n\n  // last_out: берём максимальный\n  if (r.last_out) {\n    if (!byDate[date].last_out || r.last_out > byDate[date].last_out) {\n      byDate[date].last_out = r.last_out;\n      byDate[date].outIp = cleanIp(r.outIp ?? r.device_ip ?? null);\n    }\n  }\n\n  // если IN не дал — возьмём из OUT\n  if (byDate[date].employee_id == null && r.employee_id != null) byDate[date].employee_id = r.employee_id;\n  if (byDate[date].name == null && r.name != null) byDate[date].name = r.name;\n}\n\n// === ФОРМИРУЕМ РЕЗУЛЬТАТ ПО ДНЯМ ===\nconst days = Object.entries(byDate)\n  .map(([date, v]) => {\n    const first_in = v.first_in ?? null;\n    const last_out = v.last_out ?? null;\n\n    let status = \"ok\";\n    let message = \"OK\";\n\n    if (!first_in && !last_out) {\n      status = \"no_data\";\n      message = \"За день событий нет.\";\n    } else if (!first_in || !last_out) {\n      status = \"partial\";\n      message = \"Найден только вход или только выход.\";\n    }\n\n    return {\n      date,\n      employee_id: v.employee_id ?? null,\n      name: v.name ?? null,\n      first_in,\n      last_out,\n      inIp: cleanIp(v.inIp ?? null),\n      outIp: cleanIp(v.outIp ?? null),\n      status,\n      message\n    };\n  })\n  .sort((a, b) => (a.date < b.date ? -1 : 1));\n\n// === ОБЩИЙ СТАТУС ===\nlet overall_status = \"ok\";\nlet overall_message = \"OK\";\n\nif (!days.length) {\n  overall_status = \"no_data\";\n  overall_message = \"За период событий нет.\";\n} else if (days.some(d => d.status === \"partial\")) {\n  overall_status = \"partial\";\n  overall_message = \"Данные за период получены частично.\";\n}\n\nreturn [{\n  json: {\n    status: overall_status,\n    message: overall_message,\n    days,\n    debug: {\n      in_rows: minRows.length,\n      out_rows: maxRows.length,\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        5440
+      ],
+      "id": "c52df43d-3db4-404d-860e-9aeb331f9d63",
+      "name": "Code in JavaScript15"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -400,
+        5952
+      ],
+      "id": "7bafb711-8bc3-4952-bea3-c9907c4312f7",
+      "name": "Loop Over Items4"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "name": "Replace Me4",
+      "typeVersion": 1,
+      "position": [
+        1024,
+        6384
+      ],
+      "id": "d33149e7-3086-4c3f-a786-1256e6a1af54"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "hSrBr8HztsoxDyae",
+          "mode": "list",
+          "cachedResultName": "int3",
+          "cachedResultUrl": "/projects/TmNIdtTy7ks3j2lE/datatables/hSrBr8HztsoxDyae"
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        -624,
+        5952
+      ],
+      "id": "d0a347c0-72ab-4e25-bda1-51024f4d1da3",
+      "name": "Get row(s)4"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.all().map(i => i.json);\n\n// разворачиваем: device -> days[]\nconst rows = [];\n\nfor (const r of raw) {\n  const deviceIp = r.device_ip ?? r.deviceIp ?? r.ip ?? null;\n\n  const days = Array.isArray(r.days) ? r.days : [];\n  if (!days.length) {\n    // если хочешь видеть строки даже когда данных нет — раскомментируй:\n    // rows.push({\n    //   device_ip: deviceIp,\n    //   status: r.status ?? null,\n    //   message: r.message ?? null,\n    //   date: null,\n    //   first_in: null,\n    //   employee_id: null,\n    //   name: null,\n    // });\n    continue;\n  }\n\n  for (const d of days) {\n    rows.push({\n      device_ip: deviceIp,\n      status: r.status ?? null,\n      message: r.message ?? null,\n\n      date: d.date ?? null,\n      first_in: d.first_in ?? null,\n      employee_id: d.employee_id ?? null,\n      name: d.name ?? null,\n\n      inIp: d.inIp ?? deviceIp, // на всякий\n    });\n  }\n}\n\nreturn [{\n  json: {\n    rows,\n    count: rows.length,\n    devices_count: raw.length,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        48,
+        5552
+      ],
+      "id": "291223e6-371e-4bfd-9685-afc0a60cce18",
+      "name": "Code in JavaScript16"
+    },
+    {
+      "parameters": {
+        "url": "=http://{{ $('Loop Over Items4').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Connection",
+              "value": "keep-alive"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -112,
+        6032
+      ],
+      "id": "f62141d0-3089-4894-9364-484dd737cf15",
+      "name": "Запрос токена5",
+      "alwaysOutputData": false,
+      "executeOnce": false,
+      "notesInFlow": false,
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ======= Чистая реализация MD5 (без внешних библиотек) =======\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n\n  /* -- подготовка строки -- */\n  const u8 = unescape(encodeURIComponent(str));           // UTF-8\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;             // кратно 16\n  const X = new Array(nWords).fill(0);\n\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n\n  /* -- начальные константы -- */\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n\n  /* -- основной цикл -- */\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478);   d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB);  b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF);   d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613);  b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8);   d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i +10], 17, 0xFFFF5BB1);  b = FF(b, c, d, a, X[i +11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i +12], 7, 0x6B901122);   d = FF(d, a, b, c, X[i +13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i +14], 17, 0xA679438E);  b = FF(b, c, d, a, X[i +15], 22, 0x49B40821);\n\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562);   d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i +11],14, 0x265E5A51);   b = GG(b, c, d, a, X[i + 0],20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D);   d = GG(d, a, b, c, X[i +10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i +15],14, 0xD8A1E681);   b = GG(b, c, d, a, X[i + 4],20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6);   d = GG(d, a, b, c, X[i +14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3],14, 0xF4D50D87);   b = GG(b, c, d, a, X[i + 8],20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i +13], 5, 0xA9E3E905);   d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7],14, 0x676F02D9);   b = GG(b, c, d, a, X[i +12],20, 0x8D2A4C8A);\n\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942);   d = HH(d, a, b, c, X[i + 8],11, 0x8771F681);\n    c = HH(c, d, a, b, X[i +11],16, 0x6D9D6122);   b = HH(b, c, d, a, X[i +14],23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44);   d = HH(d, a, b, c, X[i + 4],11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7],16, 0xF6BB4B60);   b = HH(b, c, d, a, X[i +10],23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i +13], 4, 0x289B7EC6);   d = HH(d, a, b, c, X[i + 0],11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3],16, 0xD4EF3085);   b = HH(b, c, d, a, X[i + 6],23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039);   d = HH(d, a, b, c, X[i +12],11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i +15],16, 0x1FA27CF8);   b = HH(b, c, d, a, X[i + 2],23, 0xC4AC5665);\n\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244);   d = II(d, a, b, c, X[i + 7],10, 0x432AFF97);\n    c = II(c, d, a, b, X[i +14],15, 0xAB9423A7);   b = II(b, c, d, a, X[i + 5],21, 0xFC93A039);\n    a = II(a, b, c, d, X[i +12], 6, 0x655B59C3);   d = II(d, a, b, c, X[i + 3],10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i +10],15, 0xFFEFF47D);   b = II(b, c, d, a, X[i + 1],21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F);   d = II(d, a, b, c, X[i +15],10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6],15, 0xA3014314);   b = II(b, c, d, a, X[i +13],21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82);   d = II(d, a, b, c, X[i +11],10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2],15, 0x2AD7D2BB);   b = II(b, c, d, a, X[i + 9],21, 0xEB86D391);\n\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n\n  const hexLE = (w) =>\n    ('0' + ( w        & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >>  8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\n// ======= Digest Auth генерируется ниже =======\nconst username = 'admin';\nconst password = 'WPvH93sqmY';\nconst method = 'POST';\nconst uri = '/ISAPI/AccessControl/AcsEvent?format=json';\nconst body = '<RemoteControlDoor><cmd>open</cmd></RemoteControlDoor>';\n\n\nconst wwwAuth = $input.first().json.headers['www-authenticate'];\nconst realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)[1];\n\nconst nc     = '00000001';\nconst cnonce = '8vNMwecd';              // фиксированный — получим тот же response\n\nconst ha1 = md5(`${username}:${realm}:${password}`);\nconst ha2 = md5(`${method}:${uri}`);\nconst response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);\n\nconst authHeader =\n  `Digest username=\"${username}\",realm=\"${realm}\",nonce=\"${nonce}\",` +\n  `uri=\"${uri}\",algorithm=\"MD5\",qop=${qop},nc=${nc},` +\n  `cnonce=\"${cnonce}\",response=\"${response}\"`;\n\nreturn { authHeader };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        112,
+        6032
+      ],
+      "id": "b68f7eb0-44a9-472e-b1ff-bdd8da8c8316",
+      "name": "Шифрование2",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $('Loop Over Items4').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $json.authHeader }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"AcsEventCond\": {\n    \"searchID\": \"in_{{$execution.id}}\",\n    \"searchResultPosition\": 0,\n    \"maxResults\": 200,\n    \"major\": 5,\n    \"minor\": 75,\n    \"startTime\": \"{{ $('Code in JavaScript14').item.json.startTime }}\",\n    \"endTime\": \"{{ $('Code in JavaScript14').item.json.endTime }}\",\n    \"employeeNoString\": \"{{ $('Code in JavaScript14').item.json.user_id }}\"\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        6032
+      ],
+      "id": "80a2ed1b-da7e-41a8-91e2-d5ee4f7525b5",
+      "name": "Регистрация пользователя2",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n  const u8 = unescape(encodeURIComponent(str));\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;\n  const X = new Array(nWords).fill(0);\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478); d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB); b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF); d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613); b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8); d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i + 10], 17, 0xFFFF5BB1); b = FF(b, c, d, a, X[i + 11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i + 12], 7, 0x6B901122); d = FF(d, a, b, c, X[i + 13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i + 14], 17, 0xA679438E); b = FF(b, c, d, a, X[i + 15], 22, 0x49B40821);\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562); d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i + 11], 14, 0x265E5A51); b = GG(b, c, d, a, X[i + 0], 20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D); d = GG(d, a, b, c, X[i + 10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i + 15], 14, 0xD8A1E681); b = GG(b, c, d, a, X[i + 4], 20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6); d = GG(d, a, b, c, X[i + 14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3], 14, 0xF4D50D87); b = GG(b, c, d, a, X[i + 8], 20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i + 13], 5, 0xA9E3E905); d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7], 14, 0x676F02D9); b = GG(b, c, d, a, X[i + 12], 20, 0x8D2A4C8A);\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942); d = HH(d, a, b, c, X[i + 8], 11, 0x8771F681);\n    c = HH(c, d, a, b, X[i + 11], 16, 0x6D9D6122); b = HH(b, c, d, a, X[i + 14], 23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44); d = HH(d, a, b, c, X[i + 4], 11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7], 16, 0xF6BB4B60); b = HH(b, c, d, a, X[i + 10], 23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i + 13], 4, 0x289B7EC6); d = HH(d, a, b, c, X[i + 0], 11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3], 16, 0xD4EF3085); b = HH(b, c, d, a, X[i + 6], 23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039); d = HH(d, a, b, c, X[i + 12], 11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i + 15], 16, 0x1FA27CF8); b = HH(b, c, d, a, X[i + 2], 23, 0xC4AC5665);\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244); d = II(d, a, b, c, X[i + 7], 10, 0x432AFF97);\n    c = II(c, d, a, b, X[i + 14], 15, 0xAB9423A7); b = II(b, c, d, a, X[i + 5], 21, 0xFC93A039);\n    a = II(a, b, c, d, X[i + 12], 6, 0x655B59C3); d = II(d, a, b, c, X[i + 3], 10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i + 10], 15, 0xFFEFF47D); b = II(b, c, d, a, X[i + 1], 21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F); d = II(d, a, b, c, X[i + 15], 10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6], 15, 0xA3014314); b = II(b, c, d, a, X[i + 13], 21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82); d = II(d, a, b, c, X[i + 11], 10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2], 15, 0x2AD7D2BB); b = II(b, c, d, a, X[i + 9], 21, 0xEB86D391);\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n  const hexLE = (w) =>\n    ('0' + (w & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\nfunction digestHeader(wwwAuth, username, password, method, uri) {\n  const realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)?.[1] ?? 'auth';\n  if (!realm || !nonce) throw new Error('Digest challenge is missing realm or nonce');\n  const nc = '00000001';\n  const cnonce = Math.random().toString(36).slice(2, 10);\n  const ha1 = md5(username + ':' + realm + ':' + password);\n  const ha2 = md5(method + ':' + uri);\n  const response = md5(ha1 + ':' + nonce + ':' + nc + ':' + cnonce + ':' + qop + ':' + ha2);\n  return 'Digest username=\"' + username + '\",realm=\"' + realm + '\",nonce=\"' + nonce + '\",uri=\"' + uri + '\",algorithm=\"MD5\",qop=' + qop + ',nc=' + nc + ',cnonce=\"' + cnonce + '\",response=\"' + response + '\"';\n}\n\nasync function httpJson(options) {\n  const response = await this.helpers.httpRequest({\n    ...options,\n    json: true,\n    simple: false,\n    resolveWithFullResponse: true,\n    returnFullResponse: true,\n    ignoreHttpStatusErrors: true,\n  });\n\n  let body = response.body ?? null;\n  if (typeof body === 'string') {\n    try { body = JSON.parse(body); } catch (e) {}\n  }\n\n  return {\n    statusCode: response.statusCode ?? response.status ?? 0,\n    headers: response.headers ?? {},\n    body,\n  };\n}\n\nfunction getHeader(headers, name) {\n  const target = name.toLowerCase();\n  const key = Object.keys(headers ?? {}).find((k) => k.toLowerCase() === target);\n  return key ? headers[key] : null;\n}\n\nasync function fetchAcsEventsPaged(deviceIp, { startTime, endTime, userId, searchPrefix }) {\n  const username = 'admin';\n  const password = 'WPvH93sqmY';\n  const uri = '/ISAPI/AccessControl/AcsEvent?format=json';\n  const url = 'http://' + deviceIp + uri;\n  const pageSize = 200;\n  const maxPages = 50;\n\n  const challenge = await httpJson.call(this, { method: 'GET', url, headers: { Connection: 'keep-alive' } });\n  const wwwAuth = getHeader(challenge.headers, 'www-authenticate');\n  if (!wwwAuth) {\n    throw new Error('Device ' + deviceIp + ' did not return digest challenge, status ' + challenge.statusCode);\n  }\n\n  const all = [];\n  for (let page = 0; page < maxPages; page++) {\n    const position = page * pageSize;\n    const body = {\n      AcsEventCond: {\n        searchID: searchPrefix + '_' + $execution.id + '_' + deviceIp + '_' + page,\n        searchResultPosition: position,\n        maxResults: pageSize,\n        major: 5,\n        minor: 75,\n        startTime,\n        endTime,\n        employeeNoString: String(userId),\n      },\n    };\n\n    const authHeader = digestHeader(wwwAuth, username, password, 'POST', uri);\n    const resp = await httpJson.call(this, {\n      method: 'POST',\n      url,\n      headers: {\n        Authorization: authHeader,\n        'Content-Type': 'application/json',\n      },\n      body,\n    });\n\n    if (resp.statusCode >= 400) {\n      throw new Error('Device ' + deviceIp + ' returned HTTP ' + resp.statusCode + ' at position ' + position);\n    }\n\n    const list = resp.body?.AcsEvent?.InfoList ?? [];\n    all.push(...list);\n\n    const total = Number(resp.body?.AcsEvent?.totalMatches ?? resp.body?.AcsEvent?.numOfMatches ?? NaN);\n    if (list.length < pageSize) break;\n    if (Number.isFinite(total) && position + list.length >= total) break;\n  }\n\n  return all;\n}\n\nfunction dayRanges(startTime, endTime) {\n  const startDate = startTime.slice(0, 10);\n  const endDate = endTime.slice(0, 10);\n  const tz = startTime.slice(19) || '+05:00';\n\n  const result = [];\n  let d = new Date(startDate + 'T00:00:00Z');\n  const end = new Date(endDate + 'T00:00:00Z');\n\n  while (d <= end) {\n    const yyyy = d.getUTCFullYear();\n    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');\n    const dd = String(d.getUTCDate()).padStart(2, '0');\n    const date = yyyy + '-' + mm + '-' + dd;\n\n    result.push({\n      date,\n      startTime: date + 'T00:00:00' + tz,\n      endTime: date + 'T23:59:59' + tz,\n    });\n\n    d.setUTCDate(d.getUTCDate() + 1);\n  }\n\n  return result;\n}\n\nconst meta = $('Loop Over Items4').item.json ?? $json ?? {};\nconst deviceIp = meta.ip ?? meta.device_ip ?? null;\nconst params = $items('Code in JavaScript14')[0].json;\n\ntry {\n  const allEvents = [];\n\n  for (const range of dayRanges(params.startTime, params.endTime)) {\n    const list = await fetchAcsEventsPaged.call(this, deviceIp, {\n      startTime: range.startTime,\n      endTime: range.endTime,\n      userId: params.user_id,\n      searchPrefix: 'in_' + range.date,\n    });\n\n    allEvents.push(...list);\n  }\n\n  const events = allEvents.filter((e) =>\n    e.major === 5 &&\n    e.minor === 75 &&\n    e.time &&\n    String(e.employeeNoString) === String(params.user_id)\n  );\n\n  const byDay = {};\n  for (const e of events) {\n    const date = e.time.slice(0, 10);\n    if (!byDay[date]) byDay[date] = [];\n    byDay[date].push(e);\n  }\n\n  const days = Object.entries(byDay).map(([date, arr]) => {\n    let first = arr[0];\n    let minMs = new Date(first.time).getTime();\n\n    for (const e of arr) {\n      const ms = new Date(e.time).getTime();\n      if (ms < minMs) {\n        first = e;\n        minMs = ms;\n      }\n    }\n\n    return {\n      date,\n      first_in: first.time,\n      employee_id: first.employeeNoString ?? null,\n      name: first.name ?? null,\n      inIp: deviceIp,\n    };\n  });\n\n  return [{\n    json: {\n      status: days.length ? 'ok' : 'no_data',\n      message: days.length ? 'OK' : 'За указанный период событий нет',\n      device_ip: deviceIp,\n      days,\n      pages_mode: 'daily',\n      raw_events: events.length,\n    },\n  }];\n} catch (error) {\n  return [{\n    json: {\n      status: 'device_error',\n      message: error.message,\n      device_ip: deviceIp,\n      days: [],\n    },\n  }];\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        6032
+      ],
+      "id": "7f939439-f474-4b5c-b3b0-02cba43fd28b",
+      "name": "Code in JavaScript17"
+    },
+    {
+      "parameters": {
+        "content": "## Минимальный вход \n",
+        "height": 256,
+        "width": 928
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -160,
+        5968
+      ],
+      "typeVersion": 1,
+      "id": "5256fbb3-7a18-4085-bf3b-1d1983c017a3",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1856,
+        5888
+      ],
+      "id": "312fabd7-58e0-49e2-997d-f387fe977292",
+      "name": "Loop Over Items5"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "name": "Replace Me5",
+      "typeVersion": 1,
+      "position": [
+        3280,
+        6320
+      ],
+      "id": "94ac6caf-0af2-48db-8216-2d314503f1f2"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "jC2cPqyW9CEm9Gjc",
+          "mode": "list",
+          "cachedResultName": "out3",
+          "cachedResultUrl": "/projects/TmNIdtTy7ks3j2lE/datatables/jC2cPqyW9CEm9Gjc"
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1632,
+        5888
+      ],
+      "id": "fe0b7e29-b46a-462c-a392-1ee451e017de",
+      "name": "Get row(s)5"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.all().map(i => i.json);\n\nconst rows = [];\n\nfor (const r of raw) {\n  const deviceIp = r.device_ip ?? r.deviceIp ?? r.ip ?? null;\n  const days = Array.isArray(r.days) ? r.days : [];\n\n  for (const d of days) {\n    rows.push({\n      device_ip: deviceIp,\n      status: r.status ?? null,\n      message: r.message ?? null,\n\n      date: d.date ?? null,\n\n      // IN\n      first_in: d.first_in ?? null,\n      inIp: d.inIp ?? null,\n\n      // OUT\n      last_out: d.last_out ?? null,\n      outIp: d.outIp ?? null,\n\n      // common\n      employee_id: d.employee_id ?? null,\n      name: d.name ?? null,\n    });\n  }\n\n  // если нужно видеть устройства без событий — добавь пустую строку\n  // if (!days.length) {\n  //   rows.push({\n  //     device_ip: deviceIp,\n  //     status: r.status ?? null,\n  //     message: r.message ?? null,\n  //     date: null,\n  //     first_in: null,\n  //     last_out: null,\n  //     employee_id: null,\n  //     name: null,\n  //     inIp: null,\n  //     outIp: null,\n  //   });\n  // }\n}\n\nreturn [{\n  json: {\n    rows,\n    count: rows.length,\n    devices_count: raw.length,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2304,
+        5488
+      ],
+      "id": "a070a6d0-c8bf-4c1b-99cc-ebbd4acc1b1c",
+      "name": "Code in JavaScript18"
+    },
+    {
+      "parameters": {
+        "url": "=http://{{ $('Loop Over Items5').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Connection",
+              "value": "keep-alive"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2272,
+        6032
+      ],
+      "id": "e2e4f7ae-7067-4563-a685-ca2691919c99",
+      "name": "Запрос токена6",
+      "alwaysOutputData": false,
+      "executeOnce": false,
+      "notesInFlow": false,
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ======= Чистая реализация MD5 (без внешних библиотек) =======\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n\n  /* -- подготовка строки -- */\n  const u8 = unescape(encodeURIComponent(str));           // UTF-8\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;             // кратно 16\n  const X = new Array(nWords).fill(0);\n\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n\n  /* -- начальные константы -- */\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n\n  /* -- основной цикл -- */\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478);   d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB);  b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF);   d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613);  b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8);   d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i +10], 17, 0xFFFF5BB1);  b = FF(b, c, d, a, X[i +11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i +12], 7, 0x6B901122);   d = FF(d, a, b, c, X[i +13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i +14], 17, 0xA679438E);  b = FF(b, c, d, a, X[i +15], 22, 0x49B40821);\n\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562);   d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i +11],14, 0x265E5A51);   b = GG(b, c, d, a, X[i + 0],20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D);   d = GG(d, a, b, c, X[i +10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i +15],14, 0xD8A1E681);   b = GG(b, c, d, a, X[i + 4],20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6);   d = GG(d, a, b, c, X[i +14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3],14, 0xF4D50D87);   b = GG(b, c, d, a, X[i + 8],20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i +13], 5, 0xA9E3E905);   d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7],14, 0x676F02D9);   b = GG(b, c, d, a, X[i +12],20, 0x8D2A4C8A);\n\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942);   d = HH(d, a, b, c, X[i + 8],11, 0x8771F681);\n    c = HH(c, d, a, b, X[i +11],16, 0x6D9D6122);   b = HH(b, c, d, a, X[i +14],23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44);   d = HH(d, a, b, c, X[i + 4],11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7],16, 0xF6BB4B60);   b = HH(b, c, d, a, X[i +10],23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i +13], 4, 0x289B7EC6);   d = HH(d, a, b, c, X[i + 0],11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3],16, 0xD4EF3085);   b = HH(b, c, d, a, X[i + 6],23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039);   d = HH(d, a, b, c, X[i +12],11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i +15],16, 0x1FA27CF8);   b = HH(b, c, d, a, X[i + 2],23, 0xC4AC5665);\n\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244);   d = II(d, a, b, c, X[i + 7],10, 0x432AFF97);\n    c = II(c, d, a, b, X[i +14],15, 0xAB9423A7);   b = II(b, c, d, a, X[i + 5],21, 0xFC93A039);\n    a = II(a, b, c, d, X[i +12], 6, 0x655B59C3);   d = II(d, a, b, c, X[i + 3],10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i +10],15, 0xFFEFF47D);   b = II(b, c, d, a, X[i + 1],21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F);   d = II(d, a, b, c, X[i +15],10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6],15, 0xA3014314);   b = II(b, c, d, a, X[i +13],21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82);   d = II(d, a, b, c, X[i +11],10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2],15, 0x2AD7D2BB);   b = II(b, c, d, a, X[i + 9],21, 0xEB86D391);\n\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n\n  const hexLE = (w) =>\n    ('0' + ( w        & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >>  8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\n// ======= Digest Auth генерируется ниже =======\nconst username = 'admin';\nconst password = 'WPvH93sqmY';\nconst method = 'POST';\nconst uri = '/ISAPI/AccessControl/AcsEvent?format=json';\nconst body = '<RemoteControlDoor><cmd>open</cmd></RemoteControlDoor>';\n\n\nconst wwwAuth = $input.first().json.headers['www-authenticate'];\nconst realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)[1];\nconst qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)[1];\n\nconst nc     = '00000001';\nconst cnonce = '8vNMwecd';              // фиксированный — получим тот же response\n\nconst ha1 = md5(`${username}:${realm}:${password}`);\nconst ha2 = md5(`${method}:${uri}`);\nconst response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);\n\nconst authHeader =\n  `Digest username=\"${username}\",realm=\"${realm}\",nonce=\"${nonce}\",` +\n  `uri=\"${uri}\",algorithm=\"MD5\",qop=${qop},nc=${nc},` +\n  `cnonce=\"${cnonce}\",response=\"${response}\"`;\n\nreturn { authHeader };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2496,
+        6032
+      ],
+      "id": "6a751d68-e173-41c1-a5ba-9b4f7c2246e7",
+      "name": "Шифрование5",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $('Loop Over Items5').item.json.ip }}/ISAPI/AccessControl/AcsEvent?format=json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $json.authHeader }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"AcsEventCond\": {\n    \"searchID\": \"in_{{$execution.id}}\",\n    \"searchResultPosition\": 0,\n    \"maxResults\": 200,\n    \"major\": 5,\n    \"minor\": 75,\n\"startTime\": \"{{ $items('Code in JavaScript14')[0].json.startTime }}\",\n\"endTime\":   \"{{ $items('Code in JavaScript14')[0].json.endTime }}\",\n\"employeeNoString\": \"{{ $items('Code in JavaScript14')[0].json.user_id }}\"\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2704,
+        6032
+      ],
+      "id": "054a2485-e93b-409e-9436-098f437dd08f",
+      "name": "Регистрация пользователя5",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\nfunction md5(str) {\n  const rotl = (l, s) => (l << s) | (l >>> (32 - s));\n  const add = (x, y) => ((x + y) & 0xFFFFFFFF) >>> 0;\n  const F = (x, y, z) => (x & y) | (~x & z);\n  const G = (x, y, z) => (x & z) | (y & ~z);\n  const H = (x, y, z) => x ^ y ^ z;\n  const I = (x, y, z) => y ^ (x | ~z);\n  const FF = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, F(b, c, d)), add(x, ac)), s), b);\n  const GG = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, G(b, c, d)), add(x, ac)), s), b);\n  const HH = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, H(b, c, d)), add(x, ac)), s), b);\n  const II = (a, b, c, d, x, s, ac) => add(rotl(add(add(a, I(b, c, d)), add(x, ac)), s), b);\n  const u8 = unescape(encodeURIComponent(str));\n  const len = u8.length;\n  const nWords = (((len + 8) >> 6) + 1) << 4;\n  const X = new Array(nWords).fill(0);\n  for (let i = 0; i < len; i++) X[i >> 2] |= u8.charCodeAt(i) << ((i % 4) * 8);\n  X[len >> 2] |= 0x80 << ((len % 4) * 8);\n  X[nWords - 2] = len * 8;\n  let a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n  for (let i = 0; i < X.length; i += 16) {\n    const [aa, bb, cc, dd] = [a, b, c, d];\n    a = FF(a, b, c, d, X[i + 0], 7, 0xD76AA478); d = FF(d, a, b, c, X[i + 1], 12, 0xE8C7B756);\n    c = FF(c, d, a, b, X[i + 2], 17, 0x242070DB); b = FF(b, c, d, a, X[i + 3], 22, 0xC1BDCEEE);\n    a = FF(a, b, c, d, X[i + 4], 7, 0xF57C0FAF); d = FF(d, a, b, c, X[i + 5], 12, 0x4787C62A);\n    c = FF(c, d, a, b, X[i + 6], 17, 0xA8304613); b = FF(b, c, d, a, X[i + 7], 22, 0xFD469501);\n    a = FF(a, b, c, d, X[i + 8], 7, 0x698098D8); d = FF(d, a, b, c, X[i + 9], 12, 0x8B44F7AF);\n    c = FF(c, d, a, b, X[i + 10], 17, 0xFFFF5BB1); b = FF(b, c, d, a, X[i + 11], 22, 0x895CD7BE);\n    a = FF(a, b, c, d, X[i + 12], 7, 0x6B901122); d = FF(d, a, b, c, X[i + 13], 12, 0xFD987193);\n    c = FF(c, d, a, b, X[i + 14], 17, 0xA679438E); b = FF(b, c, d, a, X[i + 15], 22, 0x49B40821);\n    a = GG(a, b, c, d, X[i + 1], 5, 0xF61E2562); d = GG(d, a, b, c, X[i + 6], 9, 0xC040B340);\n    c = GG(c, d, a, b, X[i + 11], 14, 0x265E5A51); b = GG(b, c, d, a, X[i + 0], 20, 0xE9B6C7AA);\n    a = GG(a, b, c, d, X[i + 5], 5, 0xD62F105D); d = GG(d, a, b, c, X[i + 10], 9, 0x02441453);\n    c = GG(c, d, a, b, X[i + 15], 14, 0xD8A1E681); b = GG(b, c, d, a, X[i + 4], 20, 0xE7D3FBC8);\n    a = GG(a, b, c, d, X[i + 9], 5, 0x21E1CDE6); d = GG(d, a, b, c, X[i + 14], 9, 0xC33707D6);\n    c = GG(c, d, a, b, X[i + 3], 14, 0xF4D50D87); b = GG(b, c, d, a, X[i + 8], 20, 0x455A14ED);\n    a = GG(a, b, c, d, X[i + 13], 5, 0xA9E3E905); d = GG(d, a, b, c, X[i + 2], 9, 0xFCEFA3F8);\n    c = GG(c, d, a, b, X[i + 7], 14, 0x676F02D9); b = GG(b, c, d, a, X[i + 12], 20, 0x8D2A4C8A);\n    a = HH(a, b, c, d, X[i + 5], 4, 0xFFFA3942); d = HH(d, a, b, c, X[i + 8], 11, 0x8771F681);\n    c = HH(c, d, a, b, X[i + 11], 16, 0x6D9D6122); b = HH(b, c, d, a, X[i + 14], 23, 0xFDE5380C);\n    a = HH(a, b, c, d, X[i + 1], 4, 0xA4BEEA44); d = HH(d, a, b, c, X[i + 4], 11, 0x4BDECFA9);\n    c = HH(c, d, a, b, X[i + 7], 16, 0xF6BB4B60); b = HH(b, c, d, a, X[i + 10], 23, 0xBEBFBC70);\n    a = HH(a, b, c, d, X[i + 13], 4, 0x289B7EC6); d = HH(d, a, b, c, X[i + 0], 11, 0xEAA127FA);\n    c = HH(c, d, a, b, X[i + 3], 16, 0xD4EF3085); b = HH(b, c, d, a, X[i + 6], 23, 0x04881D05);\n    a = HH(a, b, c, d, X[i + 9], 4, 0xD9D4D039); d = HH(d, a, b, c, X[i + 12], 11, 0xE6DB99E5);\n    c = HH(c, d, a, b, X[i + 15], 16, 0x1FA27CF8); b = HH(b, c, d, a, X[i + 2], 23, 0xC4AC5665);\n    a = II(a, b, c, d, X[i + 0], 6, 0xF4292244); d = II(d, a, b, c, X[i + 7], 10, 0x432AFF97);\n    c = II(c, d, a, b, X[i + 14], 15, 0xAB9423A7); b = II(b, c, d, a, X[i + 5], 21, 0xFC93A039);\n    a = II(a, b, c, d, X[i + 12], 6, 0x655B59C3); d = II(d, a, b, c, X[i + 3], 10, 0x8F0CCC92);\n    c = II(c, d, a, b, X[i + 10], 15, 0xFFEFF47D); b = II(b, c, d, a, X[i + 1], 21, 0x85845DD1);\n    a = II(a, b, c, d, X[i + 8], 6, 0x6FA87E4F); d = II(d, a, b, c, X[i + 15], 10, 0xFE2CE6E0);\n    c = II(c, d, a, b, X[i + 6], 15, 0xA3014314); b = II(b, c, d, a, X[i + 13], 21, 0x4E0811A1);\n    a = II(a, b, c, d, X[i + 4], 6, 0xF7537E82); d = II(d, a, b, c, X[i + 11], 10, 0xBD3AF235);\n    c = II(c, d, a, b, X[i + 2], 15, 0x2AD7D2BB); b = II(b, c, d, a, X[i + 9], 21, 0xEB86D391);\n    a = add(a, aa); b = add(b, bb); c = add(c, cc); d = add(d, dd);\n  }\n  const hexLE = (w) =>\n    ('0' + (w & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 8) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 16) & 0xFF).toString(16)).slice(-2) +\n    ('0' + ((w >> 24) & 0xFF).toString(16)).slice(-2);\n  return (hexLE(a) + hexLE(b) + hexLE(c) + hexLE(d)).toLowerCase();\n}\n\nfunction digestHeader(wwwAuth, username, password, method, uri) {\n  const realm = /realm=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const nonce = /nonce=\"([^\"]+)\"/.exec(wwwAuth)?.[1];\n  const qop = /qop=\"?([^\",]+)\"?/.exec(wwwAuth)?.[1] ?? 'auth';\n  if (!realm || !nonce) throw new Error('Digest challenge is missing realm or nonce');\n  const nc = '00000001';\n  const cnonce = Math.random().toString(36).slice(2, 10);\n  const ha1 = md5(username + ':' + realm + ':' + password);\n  const ha2 = md5(method + ':' + uri);\n  const response = md5(ha1 + ':' + nonce + ':' + nc + ':' + cnonce + ':' + qop + ':' + ha2);\n  return 'Digest username=\"' + username + '\",realm=\"' + realm + '\",nonce=\"' + nonce + '\",uri=\"' + uri + '\",algorithm=\"MD5\",qop=' + qop + ',nc=' + nc + ',cnonce=\"' + cnonce + '\",response=\"' + response + '\"';\n}\n\nasync function httpJson(options) {\n  const response = await this.helpers.httpRequest({\n    ...options,\n    json: true,\n    simple: false,\n    resolveWithFullResponse: true,\n    returnFullResponse: true,\n    ignoreHttpStatusErrors: true,\n  });\n\n  let body = response.body ?? null;\n  if (typeof body === 'string') {\n    try { body = JSON.parse(body); } catch (e) {}\n  }\n\n  return {\n    statusCode: response.statusCode ?? response.status ?? 0,\n    headers: response.headers ?? {},\n    body,\n  };\n}\n\nfunction getHeader(headers, name) {\n  const target = name.toLowerCase();\n  const key = Object.keys(headers ?? {}).find((k) => k.toLowerCase() === target);\n  return key ? headers[key] : null;\n}\n\nasync function fetchAcsEventsPaged(deviceIp, { startTime, endTime, userId, searchPrefix }) {\n  const username = 'admin';\n  const password = 'WPvH93sqmY';\n  const uri = '/ISAPI/AccessControl/AcsEvent?format=json';\n  const url = 'http://' + deviceIp + uri;\n  const pageSize = 200;\n  const maxPages = 50;\n\n  const challenge = await httpJson.call(this, { method: 'GET', url, headers: { Connection: 'keep-alive' } });\n  const wwwAuth = getHeader(challenge.headers, 'www-authenticate');\n  if (!wwwAuth) {\n    throw new Error('Device ' + deviceIp + ' did not return digest challenge, status ' + challenge.statusCode);\n  }\n\n  const all = [];\n  for (let page = 0; page < maxPages; page++) {\n    const position = page * pageSize;\n    const body = {\n      AcsEventCond: {\n        searchID: searchPrefix + '_' + $execution.id + '_' + deviceIp + '_' + page,\n        searchResultPosition: position,\n        maxResults: pageSize,\n        major: 5,\n        minor: 75,\n        startTime,\n        endTime,\n        employeeNoString: String(userId),\n      },\n    };\n\n    const authHeader = digestHeader(wwwAuth, username, password, 'POST', uri);\n    const resp = await httpJson.call(this, {\n      method: 'POST',\n      url,\n      headers: {\n        Authorization: authHeader,\n        'Content-Type': 'application/json',\n      },\n      body,\n    });\n\n    if (resp.statusCode >= 400) {\n      throw new Error('Device ' + deviceIp + ' returned HTTP ' + resp.statusCode + ' at position ' + position);\n    }\n\n    const list = resp.body?.AcsEvent?.InfoList ?? [];\n    all.push(...list);\n\n    const total = Number(resp.body?.AcsEvent?.totalMatches ?? resp.body?.AcsEvent?.numOfMatches ?? NaN);\n    if (list.length < pageSize) break;\n    if (Number.isFinite(total) && position + list.length >= total) break;\n  }\n\n  return all;\n}\n\nfunction dayRanges(startTime, endTime) {\n  const startDate = startTime.slice(0, 10);\n  const endDate = endTime.slice(0, 10);\n  const tz = startTime.slice(19) || '+05:00';\n\n  const result = [];\n  let d = new Date(startDate + 'T00:00:00Z');\n  const end = new Date(endDate + 'T00:00:00Z');\n\n  while (d <= end) {\n    const yyyy = d.getUTCFullYear();\n    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');\n    const dd = String(d.getUTCDate()).padStart(2, '0');\n    const date = yyyy + '-' + mm + '-' + dd;\n\n    result.push({\n      date,\n      startTime: date + 'T00:00:00' + tz,\n      endTime: date + 'T23:59:59' + tz,\n    });\n\n    d.setUTCDate(d.getUTCDate() + 1);\n  }\n\n  return result;\n}\n\nconst meta = $('Loop Over Items5').item.json ?? $json ?? {};\nconst deviceIp = meta.ip ?? meta.device_ip ?? null;\nconst params = $items('Code in JavaScript14')[0].json;\n\ntry {\n  const allEvents = [];\n\n  for (const range of dayRanges(params.startTime, params.endTime)) {\n    const list = await fetchAcsEventsPaged.call(this, deviceIp, {\n      startTime: range.startTime,\n      endTime: range.endTime,\n      userId: params.user_id,\n      searchPrefix: 'out_' + range.date,\n    });\n\n    allEvents.push(...list);\n  }\n\n  const events = allEvents.filter((e) =>\n    e.major === 5 &&\n    e.minor === 75 &&\n    e.time &&\n    String(e.employeeNoString) === String(params.user_id)\n  );\n\n  if (!events.length) {\n    return [{\n      json: {\n        status: 'no_data',\n        message: 'На выходном домофоне нет событий за выбранный период',\n        device_ip: deviceIp,\n        days: [],\n        pages_mode: 'daily',\n        raw_events: 0,\n      },\n    }];\n  }\n\n  const byDay = {};\n  for (const e of events) {\n    const date = e.time.slice(0, 10);\n    if (!byDay[date]) byDay[date] = [];\n    byDay[date].push(e);\n  }\n\n  const days = Object.entries(byDay).map(([date, arr]) => {\n    let last = arr[0];\n    let maxMs = new Date(last.time).getTime();\n\n    for (const e of arr) {\n      const ms = new Date(e.time).getTime();\n      if (ms > maxMs) {\n        last = e;\n        maxMs = ms;\n      }\n    }\n\n    return {\n      date,\n      last_out: last.time,\n      employee_id: last.employeeNoString ?? null,\n      name: last.name ?? null,\n      outIp: deviceIp,\n    };\n  });\n\n  return [{\n    json: {\n      status: 'ok',\n      message: 'OK',\n      device_ip: deviceIp,\n      days,\n      pages_mode: 'daily',\n      raw_events: events.length,\n    },\n  }];\n} catch (error) {\n  return [{\n    json: {\n      status: 'device_error',\n      message: error.message,\n      device_ip: deviceIp,\n      days: [],\n    },\n  }];\n}\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2944,
+        6032
+      ],
+      "id": "85a3d24b-928a-403e-b3aa-a19dcf2b62a8",
+      "name": "Code in JavaScript19"
+    },
+    {
+      "parameters": {
+        "content": "## Максимальный выход\n",
+        "height": 256,
+        "width": 832,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2256,
+        5968
+      ],
+      "typeVersion": 1,
+      "id": "b188d691-3e44-487d-9399-7b61f1d94fea",
+      "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "content": "## Зона 1",
+        "height": 1952,
+        "width": 5536,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1424,
+        352
+      ],
+      "typeVersion": 1,
+      "id": "3980e746-6bed-47a7-b725-563219907552",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "## Зона 2",
+        "height": 1952,
+        "width": 5536,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1024,
+        2688
+      ],
+      "typeVersion": 1,
+      "id": "0fe7723d-b5ee-48de-b5dc-e01fab6033fc",
+      "name": "Sticky Note7"
+    },
+    {
+      "parameters": {
+        "content": "### Зона 3",
+        "height": 1952,
+        "width": 5536,
+        "color": 2
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -928,
+        5136
+      ],
+      "typeVersion": 1,
+      "id": "9c28ef13-9952-4b28-ac67-b7b38bd4b45e",
+      "name": "Sticky Note8"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript4": {
+      "main": [
+        [
+          {
+            "node": "Get row(s)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript7": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replace Me": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript3": {
+      "main": [
+        [
+          {
+            "node": "Get row(s)1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запрос токена2": {
+      "main": [
+        [
+          {
+            "node": "Шифрование1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Шифрование1": {
+      "main": [
+        [
+          {
+            "node": "Регистрация пользователя1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Регистрация пользователя1": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript5": {
+      "main": [
+        [
+          {
+            "node": "Replace Me",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items1": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript8",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replace Me1": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s)1": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript8": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запрос токена3": {
+      "main": [
+        [
+          {
+            "node": "Шифрование3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Шифрование3": {
+      "main": [
+        [
+          {
+            "node": "Регистрация пользователя3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Регистрация пользователя3": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript6": {
+      "main": [
+        [
+          {
+            "node": "Replace Me1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript4",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript14",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Get row(s)2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript9": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items2": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript10",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript11",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replace Me2": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s)2": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript10": {
+      "main": [
+        [
+          {
+            "node": "Get row(s)3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запрос токена": {
+      "main": [
+        [
+          {
+            "node": "Шифрование",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Шифрование": {
+      "main": [
+        [
+          {
+            "node": "Регистрация пользователя",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Регистрация пользователя": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript11",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript11": {
+      "main": [
+        [
+          {
+            "node": "Replace Me2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items3": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript12",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript13",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replace Me3": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s)3": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript12": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript9",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запрос токена4": {
+      "main": [
+        [
+          {
+            "node": "Шифрование4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Шифрование4": {
+      "main": [
+        [
+          {
+            "node": "Регистрация пользователя4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Регистрация пользователя4": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript13",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript13": {
+      "main": [
+        [
+          {
+            "node": "Replace Me3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript14": {
+      "main": [
+        [
+          {
+            "node": "Get row(s)4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript15": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items4": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript16",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript17",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replace Me4": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s)4": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript16": {
+      "main": [
+        [
+          {
+            "node": "Get row(s)5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запрос токена5": {
+      "main": [
+        [
+          {
+            "node": "Шифрование2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Шифрование2": {
+      "main": [
+        [
+          {
+            "node": "Регистрация пользователя2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Регистрация пользователя2": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript17",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript17": {
+      "main": [
+        [
+          {
+            "node": "Replace Me4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items5": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript18",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript19",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replace Me5": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s)5": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript18": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript15",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Запрос токена6": {
+      "main": [
+        [
+          {
+            "node": "Шифрование5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Шифрование5": {
+      "main": [
+        [
+          {
+            "node": "Регистрация пользователя5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Регистрация пользователя5": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript19",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript19": {
+      "main": [
+        [
+          {
+            "node": "Replace Me5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "65a752e0-2605-40e7-b141-839663f583d7",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "6f3a1431131c2255e45551a775d5c4144bed08292b33917811c393a03a9cb3d3"
+  },
+  "id": "lEEoPLueYxQOtQM7dy89Y",
+  "tags": []
+}
