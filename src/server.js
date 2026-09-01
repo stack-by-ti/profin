@@ -9,6 +9,13 @@ import { OAuth2Client } from 'google-auth-library';
 import { drive_v3 } from 'googleapis/build/src/apis/drive/v3.js';
 import { sheets_v4 } from 'googleapis/build/src/apis/sheets/v4.js';
 
+import {
+  assertUmagConfigured,
+  assertValidMonth,
+  getUmagMetrics,
+  UmagError,
+} from './umag.js';
+
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN_DIR = path.resolve('.tokens');
 const TOKEN_PATH = path.join(TOKEN_DIR, 'google-oauth-token.json');
@@ -42,8 +49,20 @@ const scopes = [
 
 const app = express();
 app.use(express.json());
-const TEST_SPREADSHEET_ID = '13YA2Gz-CElMCMUNlu--7NYzl9VqBxzJtatP0LBmdcQ4';
-const PLAN_SHEET_TITLE = 'План/факт new июль';
+const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID
+  || '1DGfiNVJ_ASuua9FH3o4zYOyd7LjPdLgbXAWV8QtPI88';
+const SALES_SHEET_TITLE = process.env.GOOGLE_SALES_SHEET_TITLE || 'Продажи';
+const SHEETS_SYNC_INTERVAL_MS = Math.max(
+  Number(process.env.SHEETS_SYNC_INTERVAL_MS || 5 * 60 * 1000),
+  30 * 1000,
+);
+const sheetsCache = {
+  business: null,
+  sales: null,
+  updatedAt: null,
+  refreshPromise: null,
+  lastError: null,
+};
 const driveFileFields = [
   'id',
   'name',
@@ -106,15 +125,47 @@ function bytesToMb(value) {
   return Math.round((Number(value || 0) / 1024 / 1024) * 100) / 100;
 }
 
-function getPlanSheetTitle(month) {
-  const normalized = String(month ?? '').toLowerCase();
+const russianMonths = [
+  ['январ', 1], ['феврал', 2], ['март', 3], ['апрел', 4],
+  ['май', 5], ['мая', 5], ['июн', 6], ['июл', 7],
+  ['август', 8], ['сентябр', 9], ['октябр', 10],
+  ['ноябр', 11], ['декабр', 12],
+];
 
-  if (!normalized || normalized.includes('июл')) return PLAN_SHEET_TITLE;
-  if (normalized.includes('июн')) return 'План/факт new ИЮНЬ';
-  if (normalized.includes('мая') || normalized.includes('май')) return 'План/факт new май';
-  if (normalized.includes('апрел')) return 'План/факт new апрель';
+function getMonthNumber(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return russianMonths.find(([name]) => normalized.includes(name))?.[1] ?? 0;
+}
 
-  return null;
+function getMonthSortValue(value) {
+  const year = Number(String(value ?? '').match(/\b(20\d{2})\b/)?.[1] ?? 0);
+  return year * 100 + getMonthNumber(value);
+}
+
+function findPlanSheetTitle(month, sheetTitles) {
+  const monthNumber = getMonthNumber(month);
+  if (!monthNumber) return null;
+
+  return sheetTitles.find((title) => (
+    /^план\/факт new\b/i.test(title.trim()) && getMonthNumber(title) === monthNumber
+  )) ?? null;
+}
+
+function getLatestMonth(months) {
+  return [...months].sort((a, b) => getMonthSortValue(b) - getMonthSortValue(a))[0] ?? '';
+}
+
+function getMonthChoices(rawRows) {
+  const choices = new Map();
+
+  for (const row of getSalesRows(rawRows).rows) {
+    const key = row.date?.slice(0, 7);
+    if (key && row.month && !choices.has(key)) {
+      choices.set(key, { key, label: row.month });
+    }
+  }
+
+  return [...choices.values()].sort((a, b) => b.key.localeCompare(a.key));
 }
 
 function normalizeFile(file) {
@@ -254,6 +305,13 @@ function parsePercent(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
+function normalizeProductName(value) {
+  const name = String(value ?? '').replace(/\s+/g, ' ').trim();
+  const variantSeparator = name.search(/:\s*(?:XXXS|XXS|XS|S|M|L|XL|XXL|XXXL|стандарт|\d+)\s*(?:\/|$)/i);
+
+  return variantSeparator >= 0 ? name.slice(0, variantSeparator).trim() : name;
+}
+
 function parseSheetDate(value) {
   const match = String(value ?? '').match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
   if (!match) {
@@ -295,6 +353,15 @@ function groupMetric(rows, keyGetter, valueGetter = (row) => row.amount) {
     .sort((a, b) => b.revenue - a.revenue);
 }
 
+function groupProductsByOccurrences(rows) {
+  return groupMetric(
+    rows.filter((row) => row.product),
+    (row) => row.product,
+  )
+    .map((item) => ({ ...item, quantity: item.count }))
+    .sort((a, b) => b.quantity - a.quantity || b.revenue - a.revenue);
+}
+
 function rowsToObjects(rows) {
   const headerIndex = rows.findIndex((row) => row.includes('Дата') && row.includes('Сумма'));
   if (headerIndex < 0) {
@@ -325,7 +392,7 @@ function getSalesRows(rawRows) {
         clientName: String(row['Имя клиента'] || '').trim(),
         source: String(row['Источник'] || '').trim(),
         barcode: String(row['Шрихкод'] || row['Штрихкод'] || '').trim(),
-        product: String(row['Товар'] || '').trim(),
+        product: normalizeProductName(row['Товар']),
         category: String(row['Категория'] || '').trim(),
         color: String(row['Цвет'] || '').trim(),
         size: String(row['Размер'] || '').trim(),
@@ -385,6 +452,7 @@ function analyzeSalesRows(rawRows, options = {}) {
     bySource: groupMetric(sales, (row) => row.source).slice(0, 15),
     byPaymentMethod: groupMetric(sales, (row) => row.paymentMethod),
     topProducts: groupMetric(sales, (row) => row.product).slice(0, 15),
+    topProductsByQuantity: groupProductsByOccurrences(sales),
     returns: groupMetric(returns, (row) => row.returnReason || row.manager, (row) => Math.abs(row.amount)),
     months: [...new Set(allRows.map((row) => row.month).filter(Boolean))],
     dailyRevenue: groupMetric(sales, (row) => row.date)
@@ -452,16 +520,18 @@ function renderDashboard(analysis) {
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Drive Optimizer Dashboard</title>
+        <title>ProdFin — Продажи</title>
         <style>
           :root {
-            --ink: #17130f;
-            --muted: #6d6258;
-            --paper: #fff8ef;
-            --card: rgba(255, 255, 255, 0.78);
-            --line: rgba(55, 42, 31, 0.14);
-            --accent: #db5f2a;
-            --accent-2: #1d6f5f;
+            --navy: #0b1739;
+            --navy-2: #132654;
+            --blue: #2864dc;
+            --cyan: #29b6d8;
+            --ink: #17213b;
+            --muted: #71809f;
+            --bg: #f4f7fc;
+            --panel: #ffffff;
+            --line: #e4eaf4;
           }
 
           * { box-sizing: border-box; }
@@ -469,109 +539,173 @@ function renderDashboard(analysis) {
           body {
             margin: 0;
             color: var(--ink);
-            font-family: Georgia, "Times New Roman", serif;
-            background:
-              radial-gradient(circle at 15% 10%, rgba(219, 95, 42, 0.24), transparent 30%),
-              radial-gradient(circle at 85% 0%, rgba(29, 111, 95, 0.18), transparent 28%),
-              linear-gradient(135deg, #fffaf2 0%, #f2eadf 100%);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: var(--bg);
           }
 
-          main {
-            width: min(1180px, calc(100% - 32px));
-            margin: 0 auto;
-            padding: 42px 0 56px;
-          }
-
-          .hero {
+          .shell {
+            min-height: 100vh;
             display: grid;
-            grid-template-columns: 1.2fr 0.8fr;
-            gap: 24px;
-            align-items: end;
-            margin-bottom: 28px;
+            grid-template-columns: 228px minmax(0, 1fr);
           }
 
-          h1 {
-            margin: 0;
-            max-width: 780px;
-            font-size: clamp(42px, 7vw, 84px);
-            line-height: 0.88;
-            letter-spacing: -0.06em;
+          aside {
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            padding: 26px 18px;
+            color: #cbd7f3;
+            background: linear-gradient(180deg, var(--navy), #071028);
           }
 
-          .subtitle {
-            margin: 18px 0 0;
-            max-width: 680px;
-            color: var(--muted);
-            font-size: 18px;
+          .brand {
+            display: flex;
+            align-items: center;
+            gap: 11px;
+            padding: 0 10px 30px;
+            color: white;
+            font-size: 19px;
+            font-weight: 750;
+            letter-spacing: -.03em;
+          }
+
+          .brand-mark {
+            display: grid;
+            width: 34px;
+            height: 34px;
+            place-items: center;
+            border-radius: 10px;
+            background: linear-gradient(135deg, var(--blue), var(--cyan));
+            box-shadow: 0 8px 24px rgba(41, 182, 216, .25);
+          }
+
+          nav a {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 5px 0;
+            padding: 11px 12px;
+            border-radius: 10px;
+            color: #91a2c8;
+            font-size: 14px;
+            font-weight: 600;
+            text-decoration: none;
+          }
+
+          nav a.active {
+            color: white;
+            background: var(--navy-2);
+            box-shadow: inset 3px 0 var(--cyan);
+          }
+
+          .nav-icon { width: 20px; color: #6f83b3; text-align: center; }
+
+          .sidebar-note {
+            position: absolute;
+            right: 18px;
+            bottom: 24px;
+            left: 18px;
+            padding: 14px;
+            border: 1px solid rgba(255,255,255,.08);
+            border-radius: 12px;
+            color: #8da0c7;
+            background: rgba(255,255,255,.04);
+            font-size: 11px;
             line-height: 1.5;
           }
 
-          .stamp {
-            justify-self: end;
-            width: min(260px, 100%);
-            padding: 24px;
-            border: 1px solid var(--line);
-            border-radius: 28px;
-            background: rgba(255, 255, 255, 0.42);
-            transform: rotate(2deg);
+          main { min-width: 0; padding: 30px 34px 48px; }
+
+          .top {
+            display: flex;
+            justify-content: space-between;
+            gap: 18px;
+            align-items: center;
+            margin-bottom: 26px;
           }
 
-          .stamp strong {
-            display: block;
-            color: var(--accent-2);
-            font-size: 44px;
-            line-height: 1;
+          h1 {
+            margin: 0 0 7px;
+            font-size: 28px;
+            line-height: 1.1;
+            letter-spacing: -.035em;
           }
+
+          .subtitle {
+            margin: 0;
+            color: var(--muted);
+            font-size: 13px;
+          }
+
+          .stamp {
+            min-width: 190px;
+            padding: 13px 16px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--panel);
+            box-shadow: 0 3px 12px rgba(31,55,104,.05);
+          }
+
+          .stamp strong { display: block; margin-top: 5px; font-size: 24px; line-height: 1; }
+          .stamp p { margin: 7px 0 0; color: var(--muted); font-size: 11px; }
 
           .cards {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 14px;
-            margin-bottom: 18px;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+            gap: 12px;
+            margin-bottom: 14px;
           }
 
           .card, .panel {
             border: 1px solid var(--line);
-            border-radius: 24px;
-            background: var(--card);
-            box-shadow: 0 24px 80px rgba(53, 38, 24, 0.08);
-            backdrop-filter: blur(14px);
+            border-radius: 13px;
+            background: var(--panel);
+            box-shadow: 0 8px 28px rgba(27,50,94,.055);
           }
 
           .card {
-            min-height: 132px;
-            padding: 20px;
+            position: relative;
+            min-width: 0;
+            min-height: 122px;
+            padding: 17px;
+            overflow: hidden;
           }
+
+          .card::before { position: absolute; inset: 0 0 auto; height: 3px; background: linear-gradient(90deg,var(--blue),var(--cyan)); content: ""; }
 
           .label {
             color: var(--muted);
-            font-size: 13px;
-            letter-spacing: 0.12em;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: .07em;
             text-transform: uppercase;
           }
 
           .value {
-            margin-top: 16px;
-            font-size: clamp(28px, 4vw, 42px);
+            margin-top: 20px;
+            overflow: hidden;
+            font-size: clamp(23px, 2.35vw, 34px);
+            font-weight: 760;
             line-height: 1;
-            letter-spacing: -0.04em;
+            letter-spacing: -.045em;
+            text-overflow: ellipsis;
+            white-space: nowrap;
           }
 
           .grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 18px;
+            gap: 14px;
           }
 
-          .panel {
-            overflow: hidden;
-          }
+          .panel { min-width: 0; overflow: hidden; }
 
           .panel h2 {
             margin: 0;
-            padding: 18px 20px;
-            font-size: 24px;
-            letter-spacing: -0.03em;
+            padding: 17px 19px;
+            font-size: 15px;
+            font-weight: 750;
+            letter-spacing: -.015em;
             border-bottom: 1px solid var(--line);
           }
 
@@ -579,11 +713,11 @@ function renderDashboard(analysis) {
             width: 100%;
             border-collapse: collapse;
             font-family: ui-sans-serif, system-ui, sans-serif;
-            font-size: 14px;
+            font-size: 12px;
           }
 
           th, td {
-            padding: 12px 14px;
+            padding: 11px 14px;
             text-align: left;
             border-bottom: 1px solid var(--line);
             vertical-align: top;
@@ -591,7 +725,8 @@ function renderDashboard(analysis) {
 
           th {
             color: var(--muted);
-            font-size: 12px;
+            font-size: 10px;
+            font-weight: 700;
             text-transform: uppercase;
             letter-spacing: 0.08em;
           }
@@ -605,48 +740,49 @@ function renderDashboard(analysis) {
             border-bottom: 0;
           }
 
-          @media (max-width: 900px) {
-            .hero, .grid {
-              grid-template-columns: 1fr;
-            }
-
-            .stamp {
-              justify-self: start;
-            }
-
-            .cards {
-              grid-template-columns: repeat(2, 1fr);
-            }
+          @media (max-width: 1000px) {
+            .shell { grid-template-columns: 78px minmax(0, 1fr); }
+            aside { padding-inline: 12px; }
+            .brand-name, nav span:not(.nav-icon), .sidebar-note { display: none; }
+            nav a { justify-content: center; }
+            .cards { grid-template-columns: repeat(2, 1fr); }
+            .grid { grid-template-columns: 1fr; }
           }
 
-          @media (max-width: 560px) {
-            main {
-              width: min(100% - 20px, 1180px);
-              padding-top: 24px;
-            }
-
-            .cards {
-              grid-template-columns: 1fr;
-            }
-
-            table {
-              font-size: 13px;
-            }
-
-            th, td {
-              padding: 10px;
-            }
+          @media (max-width: 650px) {
+            .shell { display: block; }
+            aside { position: static; display: flex; align-items: center; width: 100%; height: auto; padding: 12px 14px; }
+            .brand { padding: 0; }
+            nav { display: flex; margin-left: auto; }
+            nav a { margin: 0 0 0 6px; padding: 10px 12px; }
+            .sidebar-note { display: none; }
+            main { padding: 22px 14px 36px; }
+            .top { display: block; }
+            .stamp { width: 100%; margin-top: 16px; }
+            .cards { grid-template-columns: 1fr; }
+            .panel { overflow-x: auto; }
+            table { font-size: 11px; }
+            th, td { padding: 10px; }
           }
         </style>
       </head>
       <body>
-        <main>
-          <section class="hero">
+        <div class="shell">
+          <aside>
+            <div class="brand"><span class="brand-mark">P</span><span class="brand-name">ProdFin</span></div>
+            <nav aria-label="Основная навигация">
+              <a href="/business"><span class="nav-icon">◫</span><span>Обзор</span></a>
+              <a class="active" href="/dashboard"><span class="nav-icon">↗</span><span>Продажи</span></a>
+            </nav>
+            <div class="sidebar-note">Данные синхронизируются с Google Sheets при каждом открытии страницы.</div>
+          </aside>
+          <main>
+          <section class="top">
             <div>
-              <h1>Продажи без ручной сводки</h1>
-              <p class="subtitle">Дашборд читает Google Sheets “Для тестирования функционала” через OAuth и собирает ключевые метрики по листу “Продажи”.</p>
+              <h1>Продажи</h1>
+              <p class="subtitle">Детальная аналитика по листу «Продажи» из Google Sheets.</p>
             </div>
-          <div class="stamp">
+            <div class="stamp">
               <span class="label">Валидных строк</span>
               <strong>${analysis.rows}</strong>
               <p>${analysis.skippedRows} строк пропущено как пустые/шаблонные</p>
@@ -688,7 +824,9 @@ function renderDashboard(analysis) {
             ${renderMetricTable('Топ товаров', analysis.topProducts.slice(0, 10), ['revenue', 'quantity', 'averageCheck'])}
             ${renderMetricTable('Возвраты', analysis.returns, ['revenue', 'count'])}
           </section>
-        </main>
+          </main>
+        </div>
+        <script>setTimeout(() => location.reload(), ${SHEETS_SYNC_INTERVAL_MS});</script>
       </body>
     </html>
   `;
@@ -709,38 +847,68 @@ function renderBarRows(rows, valueKey = 'revenue') {
   }).join('');
 }
 
-function renderProductRows(rows) {
+function renderProductRows(rows, pageSize = 10) {
   const maxQuantity = Math.max(...rows.map((row) => row.quantity), 1);
+  const totalPages = Math.max(Math.ceil(rows.length / pageSize), 1);
 
-  return rows.map((row) => {
+  const productRows = rows.map((row, index) => {
     const width = Math.max((row.quantity / maxQuantity) * 100, 2);
     return `
-      <div class="bar-row product-row">
+      <div class="bar-row product-row" data-product-row data-index="${index}"${index >= pageSize ? ' hidden' : ''}>
         <span>${escapeHtml(row.name)}</span>
         <div><i style="width: ${width}%"></i></div>
         <b>${row.quantity} шт. · ${formatCurrency(row.revenue)}</b>
       </div>
     `;
   }).join('');
+
+  return `
+    <div id="product-ranking">${productRows}</div>
+    <div class="pagination" id="product-pagination">
+      <button type="button" data-page-prev disabled>Назад</button>
+      <span data-page-status>Страница 1 из ${totalPages}</span>
+      <button type="button" data-page-next${totalPages === 1 ? ' disabled' : ''}>Вперёд</button>
+    </div>
+    <script>
+      (() => {
+        const root = document.getElementById('product-ranking');
+        const pagination = document.getElementById('product-pagination');
+        const rows = [...root.querySelectorAll('[data-product-row]')];
+        const pageSize = ${pageSize};
+        const totalPages = ${totalPages};
+        let page = 1;
+
+        const renderPage = () => {
+          rows.forEach((row, index) => {
+            row.hidden = index < (page - 1) * pageSize || index >= page * pageSize;
+          });
+          pagination.querySelector('[data-page-status]').textContent = 'Страница ' + page + ' из ' + totalPages;
+          pagination.querySelector('[data-page-prev]').disabled = page === 1;
+          pagination.querySelector('[data-page-next]').disabled = page === totalPages;
+        };
+
+        pagination.querySelector('[data-page-prev]').addEventListener('click', () => {
+          if (page > 1) page -= 1;
+          renderPage();
+        });
+        pagination.querySelector('[data-page-next]').addEventListener('click', () => {
+          if (page < totalPages) page += 1;
+          renderPage();
+        });
+      })();
+    </script>
+  `;
 }
 
-function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
+function renderBusinessDashboard({ analysis, plan, selectedMonth, selectedMonthKey, umag }) {
   const planValue = plan?.monthlyPlan ?? 0;
-  const revenueValue = selectedMonth && plan.factFromPlanSheet
-    ? plan.factFromPlanSheet
-    : analysis.revenue;
-  const planCompletion = selectedMonth && plan.completionFromPlanSheet
-    ? plan.completionFromPlanSheet
-    : planValue
-      ? Math.round((revenueValue / planValue) * 10000) / 100
-      : null;
-  const remaining = selectedMonth && Number.isFinite(plan.remainingFromPlanSheet)
-    ? plan.remainingFromPlanSheet
-    : planValue
-      ? Math.max(planValue - revenueValue, 0)
-      : null;
-  const monthOptions = analysis.months.map((month) => `
-    <option value="${escapeHtml(month)}" ${month === selectedMonth ? 'selected' : ''}>${escapeHtml(month)}</option>
+  const revenueValue = umag.revenue;
+  const planCompletion = planValue
+    ? Math.round((revenueValue / planValue) * 10000) / 100
+    : null;
+  const remaining = planValue ? Math.max(planValue - revenueValue, 0) : null;
+  const monthOptions = analysis.monthChoices.map(({ key, label }) => `
+    <option value="${escapeHtml(key)}" ${key === selectedMonthKey ? 'selected' : ''}>${escapeHtml(label)}</option>
   `).join('');
 
   return `
@@ -899,10 +1067,13 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
 
           .cards {
             display: grid;
-            grid-template-columns: repeat(6, minmax(0, 1fr));
+            grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 12px;
             margin-bottom: 14px;
           }
+
+          main.is-loading { opacity: .62; pointer-events: none; }
+          .business-error { margin: 8px 0 0; color: #b42318; font-size: 12px; }
 
           .card, .panel {
             border: 1px solid var(--line);
@@ -1034,6 +1205,8 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
             font-size: 12px;
           }
 
+          .product-row[hidden] { display: none; }
+
           .bar-row div {
             height: 7px;
             overflow: hidden;
@@ -1053,6 +1226,24 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
             font-variant-numeric: tabular-nums;
           }
 
+          .pagination {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            align-items: center;
+            margin-top: 16px;
+          }
+
+          .pagination span {
+            color: var(--muted);
+            font-size: 12px;
+          }
+
+          .pagination button:disabled {
+            cursor: default;
+            opacity: .45;
+          }
+
           @media (max-width: 1000px) {
             .shell { grid-template-columns: 78px minmax(0, 1fr); }
             aside { padding-inline: 12px; }
@@ -1069,12 +1260,16 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
             .shell { display: block; }
             aside {
               position: static;
+              display: flex;
+              align-items: center;
               width: 100%;
               height: auto;
-              padding: 14px 16px;
+              padding: 12px 14px;
             }
             .brand { padding: 0; }
-            nav, .sidebar-note { display: none; }
+            nav { display: flex; margin-left: auto; }
+            nav a { margin: 0 0 0 6px; padding: 10px 12px; }
+            .sidebar-note { display: none; }
             main { padding: 22px 14px 36px; }
             .cards { grid-template-columns: 1fr; }
             .plan-grid { grid-template-columns: 1fr; }
@@ -1095,8 +1290,6 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
             <nav aria-label="Основная навигация">
               <a class="active" href="/business"><span class="nav-icon">◫</span><span>Обзор</span></a>
               <a href="/dashboard"><span class="nav-icon">↗</span><span>Продажи</span></a>
-              <a href="/drive/analyze"><span class="nav-icon">◈</span><span>Google Drive</span></a>
-              <a href="/telegram/daily-report/preview"><span class="nav-icon">✦</span><span>Отчёт</span></a>
             </nav>
             <div class="sidebar-note">Данные синхронизируются с Google Sheets при каждом открытии страницы.</div>
           </aside>
@@ -1104,19 +1297,23 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
           <section class="top">
             <div>
               <h1>Бизнес-аналитика</h1>
-              <p class="muted">Период: ${escapeHtml(selectedMonth || plan.monthName || 'все месяцы')} · факт из листа “Продажи” · ${plan.sheetTitle ? `план из листа “${escapeHtml(plan.sheetTitle)}”` : 'отдельного планового листа нет'}.</p>
+              <p class="muted">Период: ${escapeHtml(selectedMonth || selectedMonthKey)} · выручка, себестоимость и маржа из UMAG · ${plan.sheetTitle ? `план из листа “${escapeHtml(plan.sheetTitle)}”` : 'отдельного планового листа нет'}.</p>
             </div>
-            <form action="/business" method="get">
-              <select name="month">
-                <option value="">Все месяцы</option>
-                ${monthOptions}
-              </select>
-              <button type="submit">Показать</button>
-            </form>
+            <div class="filter-wrap">
+              <form action="/business" method="get" data-business-filter>
+                <select name="month">
+                  ${monthOptions}
+                </select>
+                <button type="submit">Показать</button>
+              </form>
+              <p class="business-error" data-business-error role="alert" hidden></p>
+            </div>
           </section>
 
           <section class="cards">
             <article class="card"><div class="label">Выручка</div><div class="value">${formatCurrency(revenueValue)}</div></article>
+            <article class="card"><div class="label">Себестоимость</div><div class="value">${formatCurrency(umag.cost)}</div></article>
+            <article class="card"><div class="label">Маржинальность</div><div class="value">${formatPercent(umag.grossMargin)}</div></article>
             <article class="card"><div class="label">План</div><div class="value">${planValue ? formatCurrency(planValue) : 'нет'}</div></article>
             <article class="card"><div class="label">Выполнение</div><div class="value">${planCompletion === null ? 'нет' : `${planCompletion}%`}</div></article>
             <article class="card"><div class="label">Продажи</div><div class="value">${analysis.salesCount}</div></article>
@@ -1140,12 +1337,8 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
             </article>
 
             <article class="panel wide">
-              <h2>Топ продаж по количеству</h2>
-              ${renderProductRows(
-                [...analysis.topProducts]
-                  .sort((a, b) => b.quantity - a.quantity)
-                  .slice(0, 12),
-              )}
+              <h2>Продажи по количеству</h2>
+              ${renderProductRows(analysis.topProductsByQuantity)}
             </article>
 
             <article class="panel">
@@ -1172,6 +1365,51 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth }) {
           </section>
           </main>
         </div>
+        <script>
+          (() => {
+            const updateBusiness = async (form) => {
+              const main = document.querySelector('main');
+              const errorNode = main.querySelector('[data-business-error]');
+              const query = new URLSearchParams(new FormData(form));
+              const url = '/business?' + query.toString();
+              main.classList.add('is-loading');
+              main.setAttribute('aria-busy', 'true');
+              errorNode.hidden = true;
+
+              try {
+                const response = await fetch(url, { headers: { Accept: 'text/html' } });
+                if (!response.ok) {
+                  const data = await response.json().catch(() => ({}));
+                  throw new Error(data.error || 'Не удалось обновить данные.');
+                }
+
+                const html = await response.text();
+                const nextDocument = new DOMParser().parseFromString(html, 'text/html');
+                const nextMain = nextDocument.querySelector('main');
+                if (!nextMain) throw new Error('Сервер вернул некорректную страницу.');
+                main.replaceWith(nextMain);
+                history.pushState({}, '', url);
+              } catch (error) {
+                main.classList.remove('is-loading');
+                main.removeAttribute('aria-busy');
+                errorNode.textContent = error.message;
+                errorNode.hidden = false;
+              }
+            };
+
+            document.addEventListener('submit', (event) => {
+              const form = event.target.closest('[data-business-filter]');
+              if (!form) return;
+              event.preventDefault();
+              updateBusiness(form);
+            });
+
+            document.addEventListener('change', (event) => {
+              const form = event.target.closest('[data-business-filter]');
+              if (form && event.target.name === 'month') updateBusiness(form);
+            });
+          })();
+        </script>
       </body>
     </html>
   `;
@@ -1296,14 +1534,16 @@ async function buildTelegramCommandResponse(text) {
   }
 
   if (normalizedCommand === '/month') {
-    const business = await getBusinessAnalysis({ month: 'апреля 2026' });
-    const { analysis, plan } = business;
-    const completion = plan.monthlyPlan ? (analysis.revenue / plan.monthlyPlan) * 100 : 0;
+    const business = await getBusinessAnalysis();
+    const { analysis, plan, selectedMonth } = business;
+    const revenue = plan.factFromPlanSheet || analysis.revenue;
+    const completion = plan.completionFromPlanSheet
+      || (plan.monthlyPlan ? (revenue / plan.monthlyPlan) * 100 : 0);
 
     return [
-      'Monthly report: апреля 2026',
+      `Monthly report: ${selectedMonth || 'текущий период'}`,
       '',
-      `Выручка: ${formatCurrency(analysis.revenue)}`,
+      `Выручка: ${formatCurrency(revenue)}`,
       `План: ${formatCurrency(plan.monthlyPlan)}`,
       `Выполнение: ${formatPercent(completion)}`,
       `Продажи: ${analysis.salesCount}`,
@@ -1386,8 +1626,8 @@ async function getSalesAnalysis(options = {}) {
   const auth = await getAuthenticatedClient();
   const sheets = new sheets_v4.Sheets({ auth });
   const valuesResponse = await sheets.spreadsheets.values.get({
-    spreadsheetId: TEST_SPREADSHEET_ID,
-    range: "'Продажи'!A:Z",
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'${SALES_SHEET_TITLE.replaceAll("'", "''")}'!A:AJ`,
   });
 
   return analyzeSalesRows(valuesResponse.data.values ?? [], options);
@@ -1396,28 +1636,105 @@ async function getSalesAnalysis(options = {}) {
 async function getBusinessAnalysis(options = {}) {
   const auth = await getAuthenticatedClient();
   const sheets = new sheets_v4.Sheets({ auth });
-  const planSheetTitle = getPlanSheetTitle(options.month);
-  const [salesResponse, planFactResponse] = await Promise.all([
+  const [salesResponse, metadataResponse] = await Promise.all([
     sheets.spreadsheets.values.get({
-      spreadsheetId: TEST_SPREADSHEET_ID,
-      range: "'Продажи'!A:Z",
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'${SALES_SHEET_TITLE.replaceAll("'", "''")}'!A:AJ`,
     }),
-    planSheetTitle
-      ? sheets.spreadsheets.values.get({
-        spreadsheetId: TEST_SPREADSHEET_ID,
-        range: `'${planSheetTitle}'!A1:F80`,
-      })
-      : Promise.resolve({ data: { values: [] } }),
+    sheets.spreadsheets.get({
+      spreadsheetId: SPREADSHEET_ID,
+      fields: 'sheets(properties(title))',
+    }),
   ]);
 
+  const salesRows = salesResponse.data.values ?? [];
+  const monthChoices = getMonthChoices(salesRows);
+  const dateMonth = options.date
+    ? getSalesRows(salesRows).rows.find((row) => row.date === options.date)?.month
+    : '';
+  if (options.month) assertValidMonth(options.month);
+  const requestedMonthKey = options.month
+    || getSalesRows(salesRows).rows.find((row) => row.month === dateMonth)?.date?.slice(0, 7)
+    || monthChoices[0]?.key
+    || '';
+  const selectedMonth = monthChoices.find(({ key }) => key === requestedMonthKey)?.label
+    || requestedMonthKey;
+  const sheetTitles = (metadataResponse.data.sheets ?? [])
+    .map((sheet) => sheet.properties?.title)
+    .filter(Boolean);
+  const planSheetTitle = findPlanSheetTitle(selectedMonth, sheetTitles);
+  const planFactResponse = planSheetTitle
+    ? await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'${planSheetTitle.replaceAll("'", "''")}'!A1:F80`,
+    })
+    : { data: { values: [] } };
+
   return {
-    analysis: analyzeSalesRows(salesResponse.data.values ?? [], options),
+    analysis: {
+      ...analyzeSalesRows(salesRows, { ...options, month: selectedMonth }),
+      monthChoices,
+    },
     plan: {
       ...parsePlanFactNew(planFactResponse.data.values ?? []),
       sheetTitle: planSheetTitle,
     },
-    selectedMonth: options.month || '',
+    selectedMonth,
+    selectedMonthKey: requestedMonthKey,
   };
+}
+
+async function refreshSheetsCache() {
+  if (sheetsCache.refreshPromise) return sheetsCache.refreshPromise;
+
+  sheetsCache.refreshPromise = Promise.all([
+    getBusinessAnalysis(),
+    getSalesAnalysis(),
+  ])
+    .then(([business, sales]) => {
+      sheetsCache.business = business;
+      sheetsCache.sales = sales;
+      sheetsCache.updatedAt = new Date().toISOString();
+      sheetsCache.lastError = null;
+      return sheetsCache;
+    })
+    .catch((error) => {
+      sheetsCache.lastError = error.message || String(error);
+      throw error;
+    })
+    .finally(() => {
+      sheetsCache.refreshPromise = null;
+    });
+
+  return sheetsCache.refreshPromise;
+}
+
+async function getCachedBusinessAnalysis(month = '') {
+  if (month) return getBusinessAnalysis({ month });
+  if (!sheetsCache.business) await refreshSheetsCache();
+  return sheetsCache.business;
+}
+
+async function getBusinessDashboardData(month = '') {
+  if (month) assertValidMonth(month);
+  assertUmagConfigured();
+  const business = await getCachedBusinessAnalysis(month);
+  if (!business.selectedMonthKey) {
+    throw new UmagError('No month is available for the business dashboard.', {
+      code: 'MONTH_NOT_AVAILABLE',
+      status: 400,
+    });
+  }
+
+  return {
+    ...business,
+    umag: await getUmagMetrics(business.selectedMonthKey),
+  };
+}
+
+async function getCachedSalesAnalysis() {
+  if (!sheetsCache.sales) await refreshSheetsCache();
+  return sheetsCache.sales;
 }
 
 app.get('/', (_req, res) => {
@@ -1425,11 +1742,18 @@ app.get('/', (_req, res) => {
     <h1>Drive Optimizer OAuth MVP</h1>
     <p><a href="/auth/google">Connect Google Drive</a></p>
     <p>After connecting, open <a href="/drive/files">/drive/files</a>.</p>
-    <p>Or open <a href="/drive/analyze">/drive/analyze</a> for optimization insights.</p>
     <p>Sales dashboard: <a href="/dashboard">/dashboard</a>.</p>
     <p>Business analytics: <a href="/business">/business</a>.</p>
-    <p>Telegram daily report preview: <a href="/telegram/daily-report/preview">/telegram/daily-report/preview</a>.</p>
   `);
+});
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status: sheetsCache.lastError ? 'degraded' : 'ok',
+    sheetsUpdatedAt: sheetsCache.updatedAt,
+    syncIntervalMs: SHEETS_SYNC_INTERVAL_MS,
+    lastSyncError: sheetsCache.lastError,
+  });
 });
 
 app.get('/auth/google', (_req, res) => {
@@ -1533,7 +1857,7 @@ app.get('/sheets/test-functional', async (_req, res, next) => {
     const sheets = new sheets_v4.Sheets({ auth });
 
     const metadataResponse = await sheets.spreadsheets.get({
-      spreadsheetId: TEST_SPREADSHEET_ID,
+      spreadsheetId: SPREADSHEET_ID,
       fields: 'spreadsheetId,properties(title),sheets(properties(sheetId,title,index,gridProperties(rowCount,columnCount)))',
     });
 
@@ -1546,7 +1870,7 @@ app.get('/sheets/test-functional', async (_req, res, next) => {
       const columnCount = Math.min(properties.gridProperties?.columnCount ?? 26, 30);
       const range = `'${title.replaceAll("'", "''")}'!A1:${columnToLetter(columnCount)}200`;
       const valuesResponse = await sheets.spreadsheets.values.get({
-        spreadsheetId: TEST_SPREADSHEET_ID,
+        spreadsheetId: SPREADSHEET_ID,
         range,
       });
 
@@ -1580,7 +1904,7 @@ app.get('/sheets/test-functional', async (_req, res, next) => {
 
 app.get('/sheets/test-functional/sales-analysis', async (_req, res, next) => {
   try {
-    res.json(await getSalesAnalysis());
+    res.json(await getCachedSalesAnalysis());
   } catch (err) {
     if (err.code === 'ENOENT') {
       res.status(401).json({
@@ -1596,7 +1920,7 @@ app.get('/sheets/test-functional/sales-analysis', async (_req, res, next) => {
 
 app.get('/dashboard', async (_req, res, next) => {
   try {
-    const analysis = await getSalesAnalysis();
+    const analysis = await getCachedSalesAnalysis();
     res.type('html').send(renderDashboard(analysis));
   } catch (err) {
     if (err.code === 'ENOENT') {
@@ -1614,7 +1938,7 @@ app.get('/dashboard', async (_req, res, next) => {
 app.get('/business.json', async (req, res, next) => {
   try {
     const month = typeof req.query.month === 'string' ? req.query.month : '';
-    res.json(await getBusinessAnalysis({ month }));
+    res.json(await getBusinessDashboardData(month));
   } catch (err) {
     if (err.code === 'ENOENT') {
       res.status(401).json({
@@ -1631,7 +1955,7 @@ app.get('/business.json', async (req, res, next) => {
 app.get('/business', async (req, res, next) => {
   try {
     const month = typeof req.query.month === 'string' ? req.query.month : '';
-    const businessAnalysis = await getBusinessAnalysis({ month });
+    const businessAnalysis = await getBusinessDashboardData(month);
     res.type('html').send(renderBusinessDashboard(businessAnalysis));
   } catch (err) {
     if (err.code === 'ENOENT') {
@@ -1733,7 +2057,14 @@ app.post('/telegram/webhook', async (req, res, next) => {
 });
 
 app.use((err, _req, res, _next) => {
-  console.error(err);
+  console.error(err instanceof UmagError
+    ? `UMAG request failed [${err.code}]: ${err.message}`
+    : err);
+
+  if (err instanceof UmagError) {
+    res.status(err.status).json({ error: err.message, code: err.code });
+    return;
+  }
 
   if (err?.message === 'invalid_grant' || err?.response?.data?.error === 'invalid_grant') {
     res.status(401).type('html').send(`
@@ -1792,4 +2123,16 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`Drive Optimizer OAuth MVP listening on http://localhost:${PORT}`);
+
+  refreshSheetsCache()
+    .then(() => console.log(`Google Sheets cache updated at ${sheetsCache.updatedAt}`))
+    .catch((error) => console.error('Initial Google Sheets sync failed:', error.message));
+
+  const syncTimer = setInterval(() => {
+    refreshSheetsCache()
+      .then(() => console.log(`Google Sheets cache updated at ${sheetsCache.updatedAt}`))
+      .catch((error) => console.error('Scheduled Google Sheets sync failed:', error.message));
+  }, SHEETS_SYNC_INTERVAL_MS);
+
+  syncTimer.unref();
 });
