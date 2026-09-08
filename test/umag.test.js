@@ -3,7 +3,9 @@ import test from 'node:test';
 
 import {
   calculateGrossMargin,
+  dateRangeToAlmatyRange,
   getUmagMetrics,
+  getUmagMetricsForRange,
   monthToAlmatyRange,
   normalizeUmagReport,
 } from '../src/umag.js';
@@ -28,6 +30,14 @@ test('converts another YYYY-MM value without UTC date drift', () => {
     fromTime: Date.UTC(2024, 0, 31, 19),
     toTime: Date.UTC(2024, 1, 29, 18, 59, 59, 999),
   });
+});
+
+test('converts an inclusive date range to Asia/Almaty boundaries', () => {
+  assert.deepEqual(dateRangeToAlmatyRange('2026-08-15', '2026-09-09'), {
+    fromTime: Date.UTC(2026, 7, 14, 19),
+    toTime: Date.UTC(2026, 8, 9, 18, 59, 59, 999),
+  });
+  assert.throws(() => dateRangeToAlmatyRange('2026-09-10', '2026-09-09'), /later/);
 });
 
 test('rejects invalid month input', () => {
@@ -101,4 +111,26 @@ test('returns a clear configuration error without making an HTTP request', async
     (error) => error.code === 'UMAG_NOT_CONFIGURED' && error.status === 503,
   );
   assert.equal(requestCount, 0);
+});
+
+test('requests UMAG metrics for an exact date range', async () => {
+  const requests = [];
+  const responses = [
+    { ok: true, status: 200, json: async () => ({ sessionToken: 'token' }) },
+    { ok: true, status: 200, json: async () => sampleReport },
+  ];
+  const result = await getUmagMetricsForRange('2026-08-15', '2026-09-09', {
+    env: { UMAG_LOGIN: 'login', UMAG_PASSWORD: 'password', UMAG_STORE_ID: '49924' },
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return responses.shift();
+    },
+  });
+
+  const reportUrl = new URL(requests[1].url);
+  assert.equal(reportUrl.searchParams.get('fromTime'), String(Date.UTC(2026, 7, 14, 19)));
+  assert.equal(reportUrl.searchParams.get('toTime'), String(Date.UTC(2026, 8, 9, 18, 59, 59, 999)));
+  assert.equal(result.fromDate, '2026-08-15');
+  assert.equal(result.toDate, '2026-09-09');
+  assert.equal(result.grossMargin, 28.03);
 });

@@ -17,6 +17,7 @@ import {
   assertUmagConfigured,
   assertValidMonth,
   getUmagMetrics,
+  getUmagMetricsForRange,
   UmagError,
 } from './umag.js';
 
@@ -151,7 +152,7 @@ function findPlanSheetTitle(month, sheetTitles) {
   if (!monthNumber) return null;
 
   return sheetTitles.find((title) => (
-    /^план\/факт new\b/i.test(title.trim()) && getMonthNumber(title) === monthNumber
+    /^план\/факт(?:\s+new)?(?:\s|$)/i.test(title.trim()) && getMonthNumber(title) === monthNumber
   )) ?? null;
 }
 
@@ -1037,7 +1038,7 @@ function renderProductRows(rows, pageSize = 10) {
   `;
 }
 
-function renderBusinessDashboard({ analysis, plan, selectedMonth, selectedMonthKey, umag }) {
+function renderBusinessDashboard({ analysis, plan, selectedMonth, selectedMonthKey, umag, filters = {} }) {
   const planValue = plan?.monthlyPlan ?? 0;
   const revenueValue = umag.revenue;
   const planCompletion = planValue
@@ -1184,7 +1185,7 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth, selectedMonthK
             align-items: center;
           }
 
-          select, button {
+          select, input, button, .filter-reset {
             border: 1px solid var(--line);
             border-radius: 9px;
             padding: 10px 13px;
@@ -1201,6 +1202,11 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth, selectedMonthK
             font-weight: 650;
             cursor: pointer;
           }
+
+          .filter-field { display: grid; gap: 5px; }
+          .filter-field span { color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+          .filter-actions { display: flex; gap: 8px; align-items: end; }
+          .filter-reset { color: var(--ink); background: #edf2fa; text-decoration: none; box-shadow: none; }
 
           .cards {
             display: grid;
@@ -1412,8 +1418,10 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth, selectedMonthK
             .plan-grid { grid-template-columns: 1fr; }
             .bar-row { grid-template-columns: 1fr; }
             .bar-row b { text-align: left; }
-            form { width: 100%; }
-            select { min-width: 0; flex: 1; }
+            form { width: 100%; align-items: stretch; flex-direction: column; }
+            select, input { min-width: 0; width: 100%; }
+            .filter-actions { display: grid; grid-template-columns: 1fr 1fr; }
+            .filter-actions button, .filter-actions a { text-align: center; }
           }
         </style>
       </head>
@@ -1438,10 +1446,25 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth, selectedMonthK
             </div>
             <div class="filter-wrap">
               <form action="/business" method="get" data-business-filter>
-                <select name="month">
-                  ${monthOptions}
-                </select>
-                <button type="submit">Показать</button>
+                <label class="filter-field">
+                  <span>Месяц</span>
+                  <select name="month">
+                    <option value="">Выберите месяц</option>
+                    ${monthOptions}
+                  </select>
+                </label>
+                <label class="filter-field">
+                  <span>От</span>
+                  <input name="from" type="date" value="${escapeHtml(filters.dateFrom)}">
+                </label>
+                <label class="filter-field">
+                  <span>До</span>
+                  <input name="to" type="date" value="${escapeHtml(filters.dateTo)}">
+                </label>
+                <div class="filter-actions">
+                  <button type="submit">Показать</button>
+                  <a class="filter-reset" href="/business">Сбросить</a>
+                </div>
               </form>
               <p class="business-error" data-business-error role="alert" hidden></p>
             </div>
@@ -1543,7 +1566,18 @@ function renderBusinessDashboard({ analysis, plan, selectedMonth, selectedMonthK
 
             document.addEventListener('change', (event) => {
               const form = event.target.closest('[data-business-filter]');
-              if (form && event.target.name === 'month') updateBusiness(form);
+              if (!form) return;
+              const month = form.querySelector('[name="month"]');
+              const from = form.querySelector('[name="from"]');
+              const to = form.querySelector('[name="to"]');
+              if (event.target.name === 'month' && month.value) {
+                from.value = '';
+                to.value = '';
+                updateBusiness(form);
+              } else if (event.target.name === 'from' || event.target.name === 'to') {
+                if (event.target.value) month.value = '';
+                if (from.value && to.value) updateBusiness(form);
+              }
             });
           })();
         </script>
@@ -1789,39 +1823,71 @@ async function getBusinessAnalysis(options = {}) {
   ]);
 
   const salesRows = salesResponse.data.values ?? [];
+  const parsedSalesRows = getSalesRows(salesRows).rows;
   const monthChoices = getMonthChoices(salesRows);
   const dateMonth = options.date
-    ? getSalesRows(salesRows).rows.find((row) => row.date === options.date)?.month
+    ? parsedSalesRows.find((row) => row.date === options.date)?.month
     : '';
   if (options.month) assertValidMonth(options.month);
+  const rangeMode = Boolean(options.dateFrom || options.dateTo);
+  const availableDates = parsedSalesRows.map((row) => row.date).filter(Boolean).sort();
+  const rangeFrom = rangeMode ? (options.dateFrom || availableDates[0] || '') : '';
+  const rangeTo = rangeMode ? (options.dateTo || availableDates.at(-1) || '') : '';
   const requestedMonthKey = options.month
-    || getSalesRows(salesRows).rows.find((row) => row.month === dateMonth)?.date?.slice(0, 7)
+    || parsedSalesRows.find((row) => row.month === dateMonth)?.date?.slice(0, 7)
     || monthChoices[0]?.key
     || '';
-  const selectedMonth = monthChoices.find(({ key }) => key === requestedMonthKey)?.label
-    || requestedMonthKey;
+  const selectedMonthKey = rangeMode ? '' : requestedMonthKey;
+  const selectedMonth = rangeMode
+    ? `${formatDisplayDate(rangeFrom)} — ${formatDisplayDate(rangeTo)}`
+    : (monthChoices.find(({ key }) => key === requestedMonthKey)?.label || requestedMonthKey);
   const sheetTitles = (metadataResponse.data.sheets ?? [])
     .map((sheet) => sheet.properties?.title)
     .filter(Boolean);
-  const planSheetTitle = findPlanSheetTitle(selectedMonth, sheetTitles);
-  const planFactResponse = planSheetTitle
-    ? await sheets.spreadsheets.values.get({
+  const relevantMonthLabels = rangeMode
+    ? monthChoices
+      .filter(({ key }) => key >= rangeFrom.slice(0, 7) && key <= rangeTo.slice(0, 7))
+      .map(({ label }) => label)
+    : [selectedMonth];
+  const planSheetTitles = [...new Set(relevantMonthLabels
+    .map((label) => findPlanSheetTitle(label, sheetTitles))
+    .filter(Boolean))];
+  const planFactResponses = await Promise.all(planSheetTitles.map((title) => (
+    sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
-      range: `'${planSheetTitle.replaceAll("'", "''")}'!A1:F80`,
+      range: `'${title.replaceAll("'", "''")}'!A1:F80`,
     })
-    : { data: { values: [] } };
+  )));
+  const parsedPlans = planFactResponses.map((response) => parsePlanFactNew(response.data.values ?? []));
+  const periodPlan = rangeMode
+    ? parsedPlans
+      .flatMap((plan) => plan.dailyPlans)
+      .filter((day) => day.date >= rangeFrom && day.date <= rangeTo)
+      .reduce((sum, day) => sum + day.dailyPlan, 0)
+    : (parsedPlans[0]?.monthlyPlan ?? 0);
+  const basePlan = parsedPlans[0] ?? parsePlanFactNew([]);
 
   return {
     analysis: {
-      ...analyzeSalesRows(salesRows, { ...options, month: selectedMonth }),
+      ...analyzeSalesRows(salesRows, rangeMode
+        ? { dateFrom: rangeFrom, dateTo: rangeTo }
+        : { ...options, month: selectedMonth }),
       monthChoices,
     },
     plan: {
-      ...parsePlanFactNew(planFactResponse.data.values ?? []),
-      sheetTitle: planSheetTitle,
+      ...basePlan,
+      monthlyPlan: periodPlan,
+      sheetTitle: planSheetTitles.join(', '),
     },
     selectedMonth,
-    selectedMonthKey: requestedMonthKey,
+    selectedMonthKey,
+    filters: {
+      month: selectedMonthKey,
+      dateFrom: options.dateFrom || '',
+      dateTo: options.dateTo || '',
+    },
+    rangeFrom,
+    rangeTo,
   };
 }
 
@@ -1850,17 +1916,17 @@ async function refreshSheetsCache() {
   return sheetsCache.refreshPromise;
 }
 
-async function getCachedBusinessAnalysis(month = '') {
-  if (month) return getBusinessAnalysis({ month });
+async function getCachedBusinessAnalysis(filters = {}) {
+  if (filters.month || filters.dateFrom || filters.dateTo) return getBusinessAnalysis(filters);
   if (!sheetsCache.business) await refreshSheetsCache();
   return sheetsCache.business;
 }
 
-async function getBusinessDashboardData(month = '') {
-  if (month) assertValidMonth(month);
+async function getBusinessDashboardData(filters = {}) {
+  if (filters.month) assertValidMonth(filters.month);
   assertUmagConfigured();
-  const business = await getCachedBusinessAnalysis(month);
-  if (!business.selectedMonthKey) {
+  const business = await getCachedBusinessAnalysis(filters);
+  if (!business.selectedMonthKey && !(business.rangeFrom && business.rangeTo)) {
     throw new UmagError('No month is available for the business dashboard.', {
       code: 'MONTH_NOT_AVAILABLE',
       status: 400,
@@ -1869,7 +1935,9 @@ async function getBusinessDashboardData(month = '') {
 
   return {
     ...business,
-    umag: await getUmagMetrics(business.selectedMonthKey),
+    umag: business.rangeFrom && business.rangeTo
+      ? await getUmagMetricsForRange(business.rangeFrom, business.rangeTo)
+      : await getUmagMetrics(business.selectedMonthKey),
   };
 }
 
@@ -2086,8 +2154,12 @@ app.get('/dashboard', async (req, res, next) => {
 
 app.get('/business.json', async (req, res, next) => {
   try {
-    const month = typeof req.query.month === 'string' ? req.query.month : '';
-    res.json(await getBusinessDashboardData(month));
+    const filters = getDashboardFilters(req.query);
+    res.json(await getBusinessDashboardData({
+      month: filters.month,
+      dateFrom: filters.dateFrom,
+      dateTo: filters.dateTo,
+    }));
   } catch (err) {
     if (err.code === 'ENOENT') {
       res.status(401).json({
@@ -2103,8 +2175,12 @@ app.get('/business.json', async (req, res, next) => {
 
 app.get('/business', async (req, res, next) => {
   try {
-    const month = typeof req.query.month === 'string' ? req.query.month : '';
-    const businessAnalysis = await getBusinessDashboardData(month);
+    const filters = getDashboardFilters(req.query);
+    const businessAnalysis = await getBusinessDashboardData({
+      month: filters.month,
+      dateFrom: filters.dateFrom,
+      dateTo: filters.dateTo,
+    });
     res.type('html').send(renderBusinessDashboard(businessAnalysis));
   } catch (err) {
     if (err.code === 'ENOENT') {

@@ -45,6 +45,40 @@ export function monthToAlmatyRange(month) {
   return { fromTime, toTime };
 }
 
+export function dateRangeToAlmatyRange(fromDate, toDate) {
+  const parseDate = (value, field) => {
+    const match = String(value ?? '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    const date = match
+      ? new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
+      : null;
+    if (!date
+      || date.getUTCFullYear() !== Number(match[1])
+      || date.getUTCMonth() !== Number(match[2]) - 1
+      || date.getUTCDate() !== Number(match[3])) {
+      throw new UmagError(`${field} must use YYYY-MM-DD format.`, {
+        code: 'INVALID_DATE_RANGE',
+        status: 400,
+      });
+    }
+    return date;
+  };
+
+  const from = parseDate(fromDate, 'fromDate');
+  const to = parseDate(toDate, 'toDate');
+  if (from > to) {
+    throw new UmagError('fromDate must not be later than toDate.', {
+      code: 'INVALID_DATE_RANGE',
+      status: 400,
+    });
+  }
+
+  const almatyOffsetMs = 5 * 60 * 60 * 1000;
+  return {
+    fromTime: from.getTime() - almatyOffsetMs,
+    toTime: to.getTime() + 24 * 60 * 60 * 1000 - almatyOffsetMs - 1,
+  };
+}
+
 export function calculateGrossMargin(profit, revenue) {
   const normalizedRevenue = Number(revenue);
   if (!Number.isFinite(normalizedRevenue) || normalizedRevenue === 0) return 0;
@@ -153,8 +187,8 @@ async function signIn(fetchImpl, config) {
   return data.sessionToken;
 }
 
-async function requestReport(fetchImpl, config, month, sessionToken) {
-  const { fromTime, toTime } = monthToAlmatyRange(month);
+async function requestReport(fetchImpl, config, range, sessionToken) {
+  const { fromTime, toTime } = range;
   const query = new URLSearchParams({
     fromTime: String(fromTime),
     toTime: String(toTime),
@@ -191,13 +225,14 @@ export async function getUmagMetrics(month, {
   fetchImpl = globalThis.fetch,
 } = {}) {
   assertValidMonth(month);
+  const range = monthToAlmatyRange(month);
   const config = assertUmagConfigured(env);
   let sessionToken = await signIn(fetchImpl, config);
-  let report = await requestReport(fetchImpl, config, month, sessionToken);
+  let report = await requestReport(fetchImpl, config, range, sessionToken);
 
   if (report.unauthorized) {
     sessionToken = await signIn(fetchImpl, config);
-    report = await requestReport(fetchImpl, config, month, sessionToken);
+    report = await requestReport(fetchImpl, config, range, sessionToken);
   }
 
   if (report.unauthorized) {
@@ -207,4 +242,28 @@ export async function getUmagMetrics(month, {
   }
 
   return normalizeUmagReport(month, report.data);
+}
+
+export async function getUmagMetricsForRange(fromDate, toDate, {
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  const range = dateRangeToAlmatyRange(fromDate, toDate);
+  const config = assertUmagConfigured(env);
+  let sessionToken = await signIn(fetchImpl, config);
+  let report = await requestReport(fetchImpl, config, range, sessionToken);
+
+  if (report.unauthorized) {
+    sessionToken = await signIn(fetchImpl, config);
+    report = await requestReport(fetchImpl, config, range, sessionToken);
+  }
+
+  if (report.unauthorized) {
+    throw new UmagError('UMAG report authorization failed after one retry.', {
+      code: 'UMAG_REPORT_UNAUTHORIZED',
+    });
+  }
+
+  const { month: _month, ...metrics } = normalizeUmagReport(fromDate.slice(0, 7), report.data);
+  return { ...metrics, fromDate, toDate };
 }
