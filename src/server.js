@@ -419,6 +419,7 @@ function analyzeSalesRows(rawRows, options = {}) {
   const revenue = sales.reduce((sum, row) => sum + row.amount, 0);
   const quantity = sales.reduce((sum, row) => sum + row.quantity, 0);
   const discountRows = sales.filter((row) => row.discountPercent > 0);
+  const productsByQuantity = groupProductsByQuantity(sales);
 
   return {
     sheetRows: rawRows.length,
@@ -439,8 +440,8 @@ function analyzeSalesRows(rawRows, options = {}) {
     byChannel: groupMetric(sales, (row) => row.channel),
     bySource: groupMetric(sales, (row) => row.source).slice(0, 15),
     byPaymentMethod: groupMetric(sales, (row) => row.paymentMethod),
-    topProducts: groupMetric(sales, (row) => row.product).slice(0, 15),
-    topProductsByQuantity: groupProductsByQuantity(sales),
+    topProducts: productsByQuantity.slice(0, 15),
+    topProductsByQuantity: productsByQuantity,
     returns: groupMetric(returns, (row) => row.returnReason || row.manager, (row) => Math.abs(row.amount)),
     months: [...new Set(allRows.map((row) => row.month).filter(Boolean))],
     dailyRevenue: groupMetric(sales, (row) => row.date)
@@ -809,7 +810,7 @@ function renderDashboard(analysis) {
             ${renderMetricTable('Каналы продаж', analysis.byChannel)}
             ${renderMetricTable('Источники', analysis.bySource.slice(0, 10))}
             ${renderMetricTable('Способы оплаты', analysis.byPaymentMethod)}
-            ${renderMetricTable('Топ товаров', analysis.topProducts.slice(0, 10), ['revenue', 'quantity', 'averageCheck'])}
+            ${renderMetricTable('Топ товаров по количеству', analysis.topProducts.slice(0, 10), ['revenue', 'quantity', 'averageCheck'])}
             ${renderMetricTable('Возвраты', analysis.returns, ['revenue', 'count'])}
           </section>
           </main>
