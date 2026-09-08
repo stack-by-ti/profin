@@ -10,6 +10,10 @@ import { drive_v3 } from 'googleapis/build/src/apis/drive/v3.js';
 import { sheets_v4 } from 'googleapis/build/src/apis/sheets/v4.js';
 
 import {
+  groupProductsByQuantity,
+  normalizeProductName,
+} from './product-ranking.js';
+import {
   assertUmagConfigured,
   assertValidMonth,
   getUmagMetrics,
@@ -305,13 +309,6 @@ function parsePercent(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
-function normalizeProductName(value) {
-  const name = String(value ?? '').replace(/\s+/g, ' ').trim();
-  const variantSeparator = name.search(/:\s*(?:XXXS|XXS|XS|S|M|L|XL|XXL|XXXL|стандарт|\d+)\s*(?:\/|$)/i);
-
-  return variantSeparator >= 0 ? name.slice(0, variantSeparator).trim() : name;
-}
-
 function parseSheetDate(value) {
   const match = String(value ?? '').match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
   if (!match) {
@@ -351,15 +348,6 @@ function groupMetric(rows, keyGetter, valueGetter = (row) => row.amount) {
       averageCheck: item.count ? Math.round((item.revenue / item.count) * 100) / 100 : 0,
     }))
     .sort((a, b) => b.revenue - a.revenue);
-}
-
-function groupProductsByOccurrences(rows) {
-  return groupMetric(
-    rows.filter((row) => row.product),
-    (row) => row.product,
-  )
-    .map((item) => ({ ...item, quantity: item.count }))
-    .sort((a, b) => b.quantity - a.quantity || b.revenue - a.revenue);
 }
 
 function rowsToObjects(rows) {
@@ -452,7 +440,7 @@ function analyzeSalesRows(rawRows, options = {}) {
     bySource: groupMetric(sales, (row) => row.source).slice(0, 15),
     byPaymentMethod: groupMetric(sales, (row) => row.paymentMethod),
     topProducts: groupMetric(sales, (row) => row.product).slice(0, 15),
-    topProductsByQuantity: groupProductsByOccurrences(sales),
+    topProductsByQuantity: groupProductsByQuantity(sales),
     returns: groupMetric(returns, (row) => row.returnReason || row.manager, (row) => Math.abs(row.amount)),
     months: [...new Set(allRows.map((row) => row.month).filter(Boolean))],
     dailyRevenue: groupMetric(sales, (row) => row.date)
