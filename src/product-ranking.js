@@ -1,8 +1,18 @@
+const colorWordPattern = new RegExp(
+  String.raw`(?<![\p{L}\p{N}])(?:(?:светло|темно|тёмно)[-\s]?)?(?:черн|бел|бежев|сер|графит|син|голуб|красн|бордов|зел[её]н|хаки|коричнев|молочн|розов|фиолетов|оранжев|ж[её]лт|пудров|персиков|оливков|золот|серебрист|цветн)[а-яё]*(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:black|white|beige|grey|gray|blue|navy|red|green|pink|brown|orange|yellow|purple)(?![\p{L}\p{N}])`,
+  'giu',
+);
+
 export function normalizeProductName(value) {
   const name = String(value ?? '').replace(/\s+/g, ' ').trim();
   const [baseName] = name.split(':', 1);
 
-  return baseName.trim();
+  return baseName
+    .replace(/\s+(?:арт(?:икул)?\.?|article)\s*[:№#.-]?\s*[\p{L}\p{N}][\p{L}\p{N}./_-]*/giu, ' ')
+    .replace(colorWordPattern, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[\s,;/_-]+$/g, '')
+    .trim();
 }
 
 export function groupProductsByQuantity(rows) {

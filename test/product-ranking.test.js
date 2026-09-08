@@ -24,6 +24,22 @@ test('normalizes whitespace without changing a base product name', () => {
   );
 });
 
+test('removes color and article from a product name', () => {
+  assert.equal(
+    normalizeProductName('футболка укороченная черная арт.51027'),
+    'футболка укороченная',
+  );
+  assert.equal(
+    normalizeProductName('футболка укороченная белая арт. 51027'),
+    'футболка укороченная',
+  );
+});
+
+test('keeps model numbers that are not marked as an article', () => {
+  assert.equal(normalizeProductName('двойка Adidas #437'), 'двойка Adidas #437');
+  assert.equal(normalizeProductName('кеды замша цветные 3619-50'), 'кеды замша 3619-50');
+});
+
 test('combines variants and sums quantity and revenue', () => {
   const result = groupProductsByQuantity([
     {
@@ -51,4 +67,19 @@ test('combines variants and sums quantity and revenue', () => {
     averageCheck: 48_707.5,
   });
   assert.equal(result[1].name, 'другой товар');
+});
+
+test('combines products across colors and articles', () => {
+  const result = groupProductsByQuantity([
+    { product: 'футболка укороченная черная арт.51027', quantity: 7, amount: 32_900 },
+    { product: 'футболка укороченная белая арт.51027', quantity: 4, amount: 20_000 },
+  ]);
+
+  assert.deepEqual(result, [{
+    name: 'футболка укороченная',
+    revenue: 52_900,
+    count: 2,
+    quantity: 11,
+    averageCheck: 26_450,
+  }]);
 });
