@@ -35,6 +35,21 @@ test('removes color and article from a product name', () => {
   );
 });
 
+test('removes explicitly written sizes', () => {
+  assert.equal(
+    normalizeProductName('футболка укороченная M черная арт.51027'),
+    'футболка укороченная',
+  );
+  assert.equal(
+    normalizeProductName('футболка укороченная размер 42 белая'),
+    'футболка укороченная',
+  );
+  assert.equal(
+    normalizeProductName('футболка укороченная стандарт графит'),
+    'футболка укороченная',
+  );
+});
+
 test('keeps model numbers that are not marked as an article', () => {
   assert.equal(normalizeProductName('двойка Adidas #437'), 'двойка Adidas #437');
   assert.equal(normalizeProductName('кеды замша цветные 3619-50'), 'кеды замша 3619-50');

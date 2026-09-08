@@ -2,6 +2,8 @@ const colorWordPattern = new RegExp(
   String.raw`(?<![\p{L}\p{N}])(?:(?:светло|темно|тёмно)[-\s]?)?(?:черн|бел|бежев|сер|графит|син|голуб|красн|бордов|зел[её]н|хаки|коричнев|молочн|розов|фиолетов|оранжев|ж[её]лт|пудров|персиков|оливков|золот|серебрист|цветн)[а-яё]*(?![\p{L}\p{N}])|(?<![\p{L}\p{N}])(?:black|white|beige|grey|gray|blue|navy|red|green|pink|brown|orange|yellow|purple)(?![\p{L}\p{N}])`,
   'giu',
 );
+const labeledSizePattern = /\s+(?:размер|р-р)\s*[:№#.-]?\s*(?:\d{2,3}|[xsml]{1,4}|std|стандарт)\b/giu;
+const standaloneSizePattern = /(?<![\p{L}\p{N}])(?:[xsml]{1,4}|std|стандарт)(?![\p{L}\p{N}])/giu;
 
 export function normalizeProductName(value) {
   const name = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -9,6 +11,8 @@ export function normalizeProductName(value) {
 
   return baseName
     .replace(/\s+(?:арт(?:икул)?\.?|article)\s*[:№#.-]?\s*[\p{L}\p{N}][\p{L}\p{N}./_-]*/giu, ' ')
+    .replace(labeledSizePattern, ' ')
+    .replace(standaloneSizePattern, ' ')
     .replace(colorWordPattern, ' ')
     .replace(/\s+/g, ' ')
     .replace(/[\s,;/_-]+$/g, '')
