@@ -172,6 +172,47 @@ function getMonthChoices(rawRows) {
   return [...choices.values()].sort((a, b) => b.key.localeCompare(a.key));
 }
 
+function normalizeDashboardDate(value, fieldName) {
+  const normalized = String(value ?? '').trim();
+  if (!normalized) return '';
+
+  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const date = match
+    ? new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
+    : null;
+  const isValid = date
+    && date.getUTCFullYear() === Number(match[1])
+    && date.getUTCMonth() === Number(match[2]) - 1
+    && date.getUTCDate() === Number(match[3]);
+
+  if (!isValid) {
+    const error = new Error(`Invalid ${fieldName}. Expected YYYY-MM-DD.`);
+    error.status = 400;
+    throw error;
+  }
+
+  return normalized;
+}
+
+function getDashboardFilters(query = {}) {
+  const month = String(query.month ?? '').trim();
+  const dateFrom = normalizeDashboardDate(query.from, 'from');
+  const dateTo = normalizeDashboardDate(query.to, 'to');
+
+  if (month) assertValidMonth(month);
+  if (dateFrom && dateTo && dateFrom > dateTo) {
+    const error = new Error('The start date must not be later than the end date.');
+    error.status = 400;
+    throw error;
+  }
+
+  return {
+    month: dateFrom || dateTo ? '' : month,
+    dateFrom,
+    dateTo,
+  };
+}
+
 function normalizeFile(file) {
   return {
     ...file,
@@ -410,6 +451,18 @@ function analyzeSalesRows(rawRows, options = {}) {
       return false;
     }
 
+    if (options.monthKey && row.date?.slice(0, 7) !== options.monthKey) {
+      return false;
+    }
+
+    if (options.dateFrom && (!row.date || row.date < options.dateFrom)) {
+      return false;
+    }
+
+    if (options.dateTo && (!row.date || row.date > options.dateTo)) {
+      return false;
+    }
+
     return true;
   });
   const sales = rows.filter(
@@ -425,7 +478,7 @@ function analyzeSalesRows(rawRows, options = {}) {
     sheetRows: rawRows.length,
     dataRowsAfterHeader: rawObjects.length,
     rows: rows.length,
-    skippedRows: Math.max(rawObjects.length - rows.length, 0),
+    skippedRows: Math.max(rawObjects.length - allRows.length, 0),
     salesCount: sales.length,
     returnCount: returns.length,
     revenue: Math.round(revenue * 100) / 100,
@@ -502,7 +555,14 @@ function renderMetricTable(title, rows, columns = ['revenue', 'count', 'averageC
   `;
 }
 
-function renderDashboard(analysis) {
+function renderDashboard(analysis, filters = {}) {
+  const monthOptions = (analysis.monthChoices ?? []).map(({ key, label }) => `
+    <option value="${escapeHtml(key)}" ${key === filters.month ? 'selected' : ''}>${escapeHtml(label)}</option>
+  `).join('');
+  const periodLabel = filters.dateFrom || filters.dateTo
+    ? `${filters.dateFrom ? formatDisplayDate(filters.dateFrom) : 'начала'} — ${filters.dateTo ? formatDisplayDate(filters.dateTo) : 'сегодня'}`
+    : (analysis.monthChoices?.find(({ key }) => key === filters.month)?.label || 'всё время');
+
   return `
     <!doctype html>
     <html lang="ru">
@@ -626,6 +686,50 @@ function renderDashboard(analysis) {
             font-size: 13px;
           }
 
+          .filters {
+            display: flex;
+            align-items: end;
+            gap: 10px;
+            margin-bottom: 18px;
+            padding: 14px 16px;
+            border: 1px solid var(--line);
+            border-radius: 13px;
+            background: var(--panel);
+            box-shadow: 0 5px 18px rgba(27,50,94,.04);
+          }
+
+          .filter-field { display: grid; gap: 6px; }
+          .filter-field label { color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+          .filter-field select, .filter-field input {
+            height: 38px;
+            min-width: 145px;
+            padding: 0 11px;
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            color: var(--ink);
+            background: white;
+            font: inherit;
+            font-size: 13px;
+          }
+          .filter-actions { display: flex; gap: 8px; }
+          .filter-button {
+            display: inline-grid;
+            height: 38px;
+            padding: 0 16px;
+            place-items: center;
+            border: 0;
+            border-radius: 9px;
+            color: white;
+            background: var(--blue);
+            font: inherit;
+            font-size: 13px;
+            font-weight: 700;
+            text-decoration: none;
+            cursor: pointer;
+          }
+          .filter-button.secondary { color: var(--ink); background: #edf2fa; }
+          .period-note { margin-left: auto; color: var(--muted); font-size: 12px; }
+
           .stamp {
             min-width: 190px;
             padding: 13px 16px;
@@ -747,6 +851,10 @@ function renderDashboard(analysis) {
             .sidebar-note { display: none; }
             main { padding: 22px 14px 36px; }
             .top { display: block; }
+            .filters { align-items: stretch; flex-direction: column; }
+            .filter-field select, .filter-field input { width: 100%; }
+            .period-note { margin: 0; }
+            .filter-actions { display: grid; grid-template-columns: 1fr 1fr; }
             .stamp { width: 100%; margin-top: 16px; }
             .cards { grid-template-columns: 1fr; }
             .panel { overflow-x: auto; }
@@ -777,6 +885,29 @@ function renderDashboard(analysis) {
               <p>${analysis.skippedRows} строк пропущено как пустые/шаблонные</p>
             </div>
           </section>
+
+          <form class="filters" action="/dashboard" method="get" data-dashboard-filters>
+            <div class="filter-field">
+              <label for="dashboard-month">Месяц</label>
+              <select id="dashboard-month" name="month">
+                <option value="">Всё время</option>
+                ${monthOptions}
+              </select>
+            </div>
+            <div class="filter-field">
+              <label for="dashboard-from">От</label>
+              <input id="dashboard-from" name="from" type="date" value="${escapeHtml(filters.dateFrom)}">
+            </div>
+            <div class="filter-field">
+              <label for="dashboard-to">До</label>
+              <input id="dashboard-to" name="to" type="date" value="${escapeHtml(filters.dateTo)}">
+            </div>
+            <div class="filter-actions">
+              <button class="filter-button" type="submit">Показать</button>
+              <a class="filter-button secondary" href="/dashboard">Сбросить</a>
+            </div>
+            <div class="period-note">Сейчас: ${escapeHtml(periodLabel)}</div>
+          </form>
 
           <section class="cards">
             <article class="card">
@@ -815,7 +946,24 @@ function renderDashboard(analysis) {
           </section>
           </main>
         </div>
-        <script>setTimeout(() => location.reload(), ${SHEETS_SYNC_INTERVAL_MS});</script>
+        <script>
+          (() => {
+            const form = document.querySelector('[data-dashboard-filters]');
+            const month = form.querySelector('[name="month"]');
+            const from = form.querySelector('[name="from"]');
+            const to = form.querySelector('[name="to"]');
+            month.addEventListener('change', () => {
+              if (month.value) {
+                from.value = '';
+                to.value = '';
+              }
+            });
+            [from, to].forEach((input) => input.addEventListener('change', () => {
+              if (input.value) month.value = '';
+            }));
+            setTimeout(() => location.reload(), ${SHEETS_SYNC_INTERVAL_MS});
+          })();
+        </script>
       </body>
     </html>
   `;
@@ -1619,7 +1767,11 @@ async function getSalesAnalysis(options = {}) {
     range: `'${SALES_SHEET_TITLE.replaceAll("'", "''")}'!A:AJ`,
   });
 
-  return analyzeSalesRows(valuesResponse.data.values ?? [], options);
+  const salesRows = valuesResponse.data.values ?? [];
+  return {
+    ...analyzeSalesRows(salesRows, options),
+    monthChoices: getMonthChoices(salesRows),
+  };
 }
 
 async function getBusinessAnalysis(options = {}) {
@@ -1721,7 +1873,10 @@ async function getBusinessDashboardData(month = '') {
   };
 }
 
-async function getCachedSalesAnalysis() {
+async function getCachedSalesAnalysis(options = {}) {
+  if (options.monthKey || options.dateFrom || options.dateTo) {
+    return getSalesAnalysis(options);
+  }
   if (!sheetsCache.sales) await refreshSheetsCache();
   return sheetsCache.sales;
 }
@@ -1907,10 +2062,15 @@ app.get('/sheets/test-functional/sales-analysis', async (_req, res, next) => {
   }
 });
 
-app.get('/dashboard', async (_req, res, next) => {
+app.get('/dashboard', async (req, res, next) => {
   try {
-    const analysis = await getCachedSalesAnalysis();
-    res.type('html').send(renderDashboard(analysis));
+    const filters = getDashboardFilters(req.query);
+    const analysis = await getCachedSalesAnalysis({
+      monthKey: filters.month,
+      dateFrom: filters.dateFrom,
+      dateTo: filters.dateTo,
+    });
+    res.type('html').send(renderDashboard(analysis, filters));
   } catch (err) {
     if (err.code === 'ENOENT') {
       res.status(401).json({
@@ -2107,7 +2267,7 @@ app.use((err, _req, res, _next) => {
     return;
   }
 
-  res.status(500).json({ error: err.message || 'Internal server error' });
+  res.status(err?.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
 app.listen(PORT, () => {
